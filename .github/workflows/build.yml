@@ -1,0 +1,120 @@
+name: Build binaries
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allow the release job to upload assets on tags
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: arm, goarm: '7' }
+          - { goos: windows, goarch: amd64, ext: '.exe' }
+          - { goos: windows, goarch: arm64, ext: '.exe' }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: breach/go.mod
+          cache-dependency-path: breach/go.sum
+
+      - name: Build
+        working-directory: breach
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          suffix="${GOOS}-${GOARCH}"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/breach-client-${suffix}${{ matrix.ext }}" ./cmd/client
+          go build -trimpath -ldflags "-s -w" -o "dist/breach-server-${suffix}${{ matrix.ext }}" ./cmd/server
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: breach-client-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: breach/dist/breach-client-*
+          if-no-files-found: error
+
+      - name: Upload server
+        uses: actions/upload-artifact@v4
+        with:
+          name: breach-server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: breach/dist/breach-server-*
+          if-no-files-found: error
+
+  android:
+    name: android/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: breach/go.mod
+          cache-dependency-path: breach/go.sum
+
+      - name: Build (NDK)
+        working-directory: breach
+        env:
+          CGO_ENABLED: '1'
+          GOOS: android
+          GOARCH: arm64
+        run: |
+          CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          mkdir -p dist
+          CC="$CC" go build -trimpath -ldflags "-s -w" -o "dist/breach-client-android-arm64" ./cmd/client
+          CC="$CC" go build -trimpath -ldflags "-s -w" -o "dist/breach-server-android-arm64" ./cmd/server
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: breach-client-android-arm64
+          path: breach/dist/breach-client-android-arm64
+          if-no-files-found: error
+
+      - name: Upload server
+        uses: actions/upload-artifact@v4
+        with:
+          name: breach-server-android-arm64
+          path: breach/dist/breach-server-android-arm64
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ build, android ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect + checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'breach-*' -exec cp {} release/ \;
+          cd release
+          sha256sum breach-* > SHA256SUMS.txt
+          ls -la; cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

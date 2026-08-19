@@ -1,0 +1,135 @@
+name: Exit image
+
+# Publishes the ready-to-run exit container to
+#   ghcr.io/<owner>/breach-exit:{latest,<tag>,sha-<short>}
+# for linux/amd64 + linux/arm64, so a VPS only ever runs `docker run` / compose
+# and never has to clone the repo or build Go.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+    paths:
+      - 'breach/**'
+      - '.github/workflows/exit-image.yml'
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: build + push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (registry refs must be lowercase)
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/breach-exit" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: breach
+          file: breach/deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (hy2-only — needs no caps)
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          # Boot the just-pushed image and check the exit really comes up:
+          # sing-box starts, a user can be provisioned, the block is valid JSON,
+          # and the container survives the sing-box bounce that provisioning does.
+          docker run -d --name smoke -e PROTO=hy2 -e PUBLIC_ENDPOINT=203.0.113.1:48000 "$REF"
+          for _ in $(seq 40); do
+            docker logs smoke 2>&1 | grep -q 'breach-exit: PROTO=hy2' && break
+            sleep 1
+          done
+          docker logs smoke
+          # sing-box is a custom minimal build: assert the two tags the exit needs
+          # are actually in it (a missing with_gvisor passes `check` and only
+          # breaks when the WG tun starts, so verify the tag itself, not a config).
+          docker exec smoke sing-box version
+          docker exec smoke sing-box version | grep -q 'with_quic'
+          docker exec smoke sing-box version | grep -q 'with_gvisor'
+          docker exec smoke provision-client smoketest | tee /tmp/block
+          sed -n '/CONFIG-BEGIN/,/CONFIG-END/p' /tmp/block | sed '1d;$d' | python3 -m json.tool
+          docker exec smoke list-clients | python3 -m json.tool
+          docker exec smoke stats | python3 -m json.tool
+          # the deployment files must ride inside the image (install.sh extracts
+          # them from here instead of raw.githubusercontent, so a private repo works)
+          for f in docker-compose.yml docker-compose.hy2.yml .env.example install.sh; do
+            docker run --rm --entrypoint cat "$REF" "/usr/local/share/breach/$f" | head -1
+          done
+          sleep 5
+          [ "$(docker inspect -f '{{.State.Running}}' smoke)" = true ]
+          docker exec smoke pgrep -f 'sing-box run' >/dev/null
+          docker rm -f smoke
+
+      - name: Smoke test (both protocols — exercises the WG tun path)
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          # PROTO=both is the mode that actually starts wireguard-go and sing-box's
+          # tun. A sing-box built without with_gvisor passes `check` and dies only
+          # here, so this is the test that guards the minimal build.
+          docker run -d --name smoke2 --init \
+            --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 \
+            -e PROTO=both -e PUBLIC_ENDPOINT=203.0.113.1:48000 "$REF"
+          for _ in $(seq 40); do
+            docker logs smoke2 2>&1 | grep -q 'breach-exit: PROTO=both' && break
+            sleep 1
+          done
+          sleep 5
+          docker logs smoke2
+          # both inner servers must be live: wireguard-go's wg0 and sing-box's tun
+          docker exec smoke2 ip link show wg0
+          docker exec smoke2 ip link show singtun
+          docker exec smoke2 wg show wg0 >/dev/null
+          docker exec smoke2 ip rule list | grep -q '10.9.0.0/24'
+          # and nothing may have complained about a stripped-out feature
+          ! docker logs smoke2 2>&1 | grep -iE 'not included in this build'
+          docker exec smoke2 provision-client wgtest | grep -q '"wireguard":{'
+          docker exec smoke2 stats | python3 -m json.tool
+          [ "$(docker inspect -f '{{.State.Running}}' smoke2)" = true ]
+          docker rm -f smoke2
+
+      - name: Summary
+        run: |
+          {
+            echo "### breach-exit pushed"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

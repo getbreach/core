@@ -1,0 +1,34 @@
+{
+  "host": "api2.oneme.ru",
+  "port": 443,
+
+  "token": "PASTE_MAX_LOGIN_TOKEN",
+  "deviceId": "PASTE_SPOOFED_DEVICE_ID",
+  "instanceId": "PASTE_INSTANCE_ID",
+  "clientSessionId": 118,
+  "userAgent": {
+    "deviceType": "ANDROID",
+    "appVersion": "26.23.2",
+    "osVersion": "Android 14",
+    "timezone": "Europe/Moscow",
+    "screen": "420dpi 420dpi 1080x2340",
+    "pushDeviceType": "GCM",
+    "arch": "arm64-v8a",
+    "locale": "ru",
+    "buildNumber": 6779,
+    "deviceName": "Google Pixel 7 Pro",
+    "deviceLocale": "ru"
+  },
+
+  "mintMode": "silent",
+  "calleeId": 0,
+  "sdkVersion": "0.2.1.3",
+  "clientAppKey": "CGPGAGLGDIHBABABA",
+  "capabilities": "3c02f",
+
+  "server": "YOUR_VPS_IP:48000",
+  "wgListen": "127.0.0.1:51821",
+  "streams": 4,
+  "mints": 1,
+  "dns": "77.88.8.8:53"
+}

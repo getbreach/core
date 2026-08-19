@@ -1,0 +1,63 @@
+# breach-exit — ready-to-run exit. Nothing to build: the image is published to
+# GHCR by .github/workflows/exit-image.yml.
+#
+#   docker compose up -d
+#   docker compose exec breach-exit provision-client phoneA
+#
+# A copy of this file ships inside the image, so a server can get it without
+# touching GitHub (works with a private repo):
+#
+#   docker run --rm --entrypoint cat ghcr.io/getbreach/breach-exit:latest \
+#     /usr/local/share/breach/docker-compose.yml > docker-compose.yml
+#
+# Settings come from a sibling .env (see .env.example) — or just edit below.
+# `deploy/install.sh` does all of this for you on a fresh VPS.
+
+services:
+  breach-exit:
+    image: ${BREACH_IMAGE:-ghcr.io/getbreach/breach-exit:latest}
+    # Local build instead of the published image (needs the repo checked out;
+    # run compose from breach/deploy/):
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile
+    container_name: breach-exit
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${RELAY_PORT:-48000}:${RELAY_PORT:-48000}/udp"
+    volumes:
+      # State: server keys, client registry, Hy2 cert. Survives restarts and
+      # image upgrades — the exit keeps its identity, clients keep working.
+      - breach-data:/etc/breach
+    environment:
+      PROTO: ${PROTO:-both}
+      RELAY_LISTEN: ":${RELAY_PORT:-48000}"
+      HY2_SNI: ${HY2_SNI:-www.bing.com}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KEEPALIVE_MS: ${KEEPALIVE_MS:-50}
+      # Advertised to clients. Empty -> autodetected via api.ipify.org at first
+      # boot and frozen in the volume's `meta`.
+      PUBLIC_ENDPOINT: ${PUBLIC_ENDPOINT:-}
+    # Required by the WireGuard half (PROTO=both|wg): wireguard-go needs a real
+    # tun, and forwarding must be on inside the netns. Harmless for PROTO=hy2,
+    # but if the host has no /dev/net/tun, use the hy2-only override below.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    healthcheck:
+      # The exit is healthy while breach-server holds the public UDP port.
+      test: ["CMD-SHELL", "pgrep -f breach-server >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  breach-data:

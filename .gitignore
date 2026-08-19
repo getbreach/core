@@ -1,0 +1,14 @@
+# secrets — never commit real MAX tokens
+config.json
+**/config.json
+
+# build artifacts
+/maxmint/maxmint
+/turnprobe/turnprobe
+/breach/bin/
+*.bin
+*.pcap
+
+# local exit deployment settings (real endpoints/passwords)
+breach/deploy/.env
+breach/client

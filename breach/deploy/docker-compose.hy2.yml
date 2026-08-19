@@ -1,0 +1,20 @@
+# Hysteria2-only overlay: drops the WireGuard-side privileges (no NET_ADMIN, no
+# /dev/net/tun, no ip_forward). Use on hosts without a tun device, or when you
+# only ever want Hy2:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.hy2.yml up -d
+#
+# Note: PROTO is baked into the volume's state only for the cert/keys — switching
+# an existing exit to hy2-only keeps its Hy2 users; its WG peers just stop being
+# served.
+#
+# Needs Compose v2.24+ (`!reset`). On older Compose, edit docker-compose.yml and
+# delete the cap_add/devices/sysctls blocks by hand.
+
+services:
+  breach-exit:
+    environment:
+      PROTO: hy2
+    cap_add: !reset []
+    devices: !reset []
+    sysctls: !reset {}
