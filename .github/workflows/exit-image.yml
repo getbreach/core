@@ -102,6 +102,8 @@ jobs:
           # PROTO=both is the mode that actually starts wireguard-go and sing-box's
           # tun. A sing-box built without with_gvisor passes `check` and dies only
           # here, so this is the test that guards the minimal build.
+          sudo modprobe tun
+          test -c /dev/net/tun
           docker run -d --name smoke2 --init \
             --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 \
             -e PROTO=both -e PUBLIC_ENDPOINT=203.0.113.1:48000 "$REF"
