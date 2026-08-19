@@ -90,6 +90,7 @@ func main() {
 	login := flag.String("login", "", "authenticate a phone number (+7...) by SMS, save the session and print a config block")
 	loginHost := flag.String("login-host", "", "MAX API host for -login (default "+maxproto.DefaultHost+")")
 	sessionPath := flag.String("session", "", "session file: -login writes it, and a later run loads the token from it instead of -config")
+	device := flag.String("device", "", `-login: spoof cosmetic device info, JSON e.g. '{"deviceName":"samsung SM-S918B","osVersion":"Android 14","screen":"480dpi 480dpi 1440x3088"}' (appVersion/arch stay locked)`)
 	dnsFlag := flag.String("dns", "", "resolver for the MAX API host (default 1.1.1.1:53 or config \"dns\")")
 	flag.BoolVar(&maxproto.Verbose, "v", false, "verbose")
 	flag.Parse()
@@ -98,7 +99,7 @@ func main() {
 	// config for someone who has no token yet.
 	if *login != "" {
 		setResolver(*dnsFlag)
-		if err := runLogin(*login, *loginHost, *sessionPath); err != nil {
+		if err := runLogin(*login, *loginHost, *sessionPath, *device); err != nil {
 			log.Fatalf("login: %v", err)
 		}
 		return
@@ -346,11 +347,24 @@ func setResolver(dns string) {
 // when sessionPath is set — saves a session so later runs skip the SMS. The
 // token is bound to the generated device identity, so both are kept together;
 // re-running -login sends a new SMS and mints a new identity.
-func runLogin(phone, host, sessionPath string) error {
+func runLogin(phone, host, sessionPath, deviceJSON string) error {
 	cfg, err := maxproto.NewAuthConfig(host, nil)
 	if err != nil {
 		return err
 	}
+	// Spoof only the cosmetic device fields; appVersion/buildNumber/arch stay
+	// locked to the fingerprint build. With no -device, pick a RANDOM device so
+	// installs don't all report the same phone.
+	if deviceJSON != "" {
+		var d maxproto.DeviceInfo
+		if err := json.Unmarshal([]byte(deviceJSON), &d); err != nil {
+			return fmt.Errorf("bad -device JSON: %w", err)
+		}
+		cfg.UserAgent = maxproto.UserAgentFor(d)
+	} else {
+		cfg.UserAgent = maxproto.RandomDeviceUserAgent()
+	}
+	log.Printf("device: %s", cfg.UserAgent.DeviceName)
 	stdin := bufio.NewReader(os.Stdin)
 
 	log.Printf("authenticating %s via %s", maxproto.MaskPhone(maxproto.NormalizePhone(phone)), cfg.Host)

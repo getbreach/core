@@ -21,6 +21,12 @@ type StoredSession struct {
 	Identity  Identity  `json:"identity"`
 	UserAgent UserAgent `json:"userAgent"`
 
+	// ClientSessionID is the real client's monotonic per-account session counter:
+	// it increments by one on every use of the account (BumpClientSession). A
+	// constant value across sessions is a fingerprint that outs the client, so it
+	// is persisted here and advanced each connect.
+	ClientSessionID int `json:"clientSessionId"`
+
 	SdkVersion   string `json:"sdkVersion,omitempty"`
 	ClientAppKey string `json:"clientAppKey,omitempty"`
 	Capabilities string `json:"capabilities,omitempty"`
@@ -32,13 +38,14 @@ type StoredSession struct {
 // token/account into a StoredSession.
 func SessionFromConfig(cfg *Config, accountID int64, profile *Profile) *StoredSession {
 	s := &StoredSession{
-		Token:        cfg.Token,
-		AccountID:    accountID,
-		Identity:     Identity{DeviceID: cfg.DeviceID, InstanceID: cfg.InstanceID},
-		UserAgent:    cfg.UserAgent,
-		SdkVersion:   cfg.SdkVersion,
-		ClientAppKey: cfg.ClientAppKey,
-		Capabilities: cfg.Capabilities,
+		Token:           cfg.Token,
+		AccountID:       accountID,
+		Identity:        Identity{DeviceID: cfg.DeviceID, InstanceID: cfg.InstanceID},
+		UserAgent:       cfg.UserAgent,
+		ClientSessionID: cfg.ClientSessionID,
+		SdkVersion:      cfg.SdkVersion,
+		ClientAppKey:    cfg.ClientAppKey,
+		Capabilities:    cfg.Capabilities,
 	}
 	if profile != nil {
 		if s.AccountID == 0 {
@@ -62,7 +69,7 @@ func (s *StoredSession) Config(host string) *Config {
 		Token:           s.Token,
 		DeviceID:        s.Identity.DeviceID,
 		InstanceID:      s.Identity.InstanceID,
-		ClientSessionID: 1,
+		ClientSessionID: s.clientSessionOrDefault(),
 		UserAgent:       s.UserAgent,
 		SdkVersion:      s.SdkVersion,
 		ClientAppKey:    s.ClientAppKey,
@@ -126,4 +133,21 @@ func LoadSession(path string) (*StoredSession, error) {
 		return nil, fmt.Errorf("LoadSession: %s has no token/identity", path)
 	}
 	return &s, nil
+}
+
+// clientSessionOrDefault returns the stored counter, or 1 for a session that
+// predates the field / has never been advanced.
+func (s *StoredSession) clientSessionOrDefault() int {
+	if s.ClientSessionID < 1 {
+		return 1
+	}
+	return s.ClientSessionID
+}
+
+// BumpClientSession advances the per-account session counter and returns the new
+// value. Call it once per connect (each "use of the account"), then persist the
+// session, so clientSessionId grows by one each time like the real client.
+func (s *StoredSession) BumpClientSession() int {
+	s.ClientSessionID = s.clientSessionOrDefault() + 1
+	return s.ClientSessionID
 }

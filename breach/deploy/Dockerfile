@@ -21,7 +21,7 @@
 # --- build breach-server (pure Go, no cgo) ---
 # Runs on the BUILD platform and cross-compiles to the TARGET one: pure Go needs
 # no emulation, so multi-arch buildx stays fast.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 ARG TARGETARCH
 ARG TARGETVARIANT
 ENV CGO_ENABLED=0 GOOS=linux
@@ -57,7 +57,7 @@ RUN mkdir /wg && cd /wg && go mod init wgbuild >/dev/null \
 #
 # Want per-user Hy2 traffic in `stats` later? That needs sing-box's API --
 # add `with_clash_api` (or with_v2ray_api,with_grpc) to SINGBOX_TAGS.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS singbox
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS singbox
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG SINGBOX_VERSION=v1.13.13

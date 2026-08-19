@@ -415,9 +415,9 @@ func NewAuthConfig(host string, id *Identity) (*Config, error) {
 		InstanceID:      id.InstanceID,
 		ClientSessionID: 1,
 		UserAgent:       DefaultUserAgent(),
-		SdkVersion:      "0.1.16.4",
-		ClientAppKey:    "CGPGAGLGDIHBABABA",
-		Capabilities:    "3c03f",
+		SdkVersion:      DefaultSdkVersion,
+		ClientAppKey:    DefaultClientAppKey,
+		Capabilities:    DefaultCapabilities,
 		MintMode:        "silent",
 	}, nil
 }

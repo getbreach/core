@@ -10,7 +10,16 @@ on:
     branches: [ main ]
     tags: [ 'v*' ]
     paths:
-      - 'breach/**'
+      # Only rebuild the exit image when the SERVER side changes: breach-server
+      # (cmd/server + its deps media, dtlscfg), the deploy container, the module
+      # deps, or this workflow. Client-only changes (cmd/client, maxproto, turn,
+      # mobile) don't ship in the image, so they don't trigger a rebuild.
+      - 'breach/cmd/server/**'
+      - 'breach/media/**'
+      - 'breach/dtlscfg/**'
+      - 'breach/deploy/**'
+      - 'breach/go.mod'
+      - 'breach/go.sum'
       - '.github/workflows/exit-image.yml'
   workflow_dispatch:
 

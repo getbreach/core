@@ -12,3 +12,11 @@ config.json
 # local exit deployment settings (real endpoints/passwords)
 breach/deploy/.env
 breach/client
+
+# Working clone of github.com/getbreach/sing-box (our fork, branch `breach`).
+# It is its own repo — breachbox/go.mod pins it by tag, so this checkout is
+# only needed when changing the fork itself.
+sing-box/
+.DS_Store
+breachbox/
+*.png
