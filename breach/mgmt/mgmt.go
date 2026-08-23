@@ -44,11 +44,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -58,6 +60,7 @@ type Options struct {
 	ConfDir       string // state dir: secret, cert, and the client registry the tools use
 	BinDir        string // dir holding provision-client/list-clients/remove-client/stats
 	AdvertiseHost string // public host/IP embedded in the handle URL the app connects to
+	ClashPort     int    // sing-box Clash API port on loopback (per-user Hy2 stats)
 }
 
 // validName gates every client name before it reaches a shell tool or the TSV
@@ -79,6 +82,9 @@ func Run(opt Options) error {
 	}
 	if opt.Listen == "" {
 		opt.Listen = ":48000"
+	}
+	if opt.ClashPort == 0 {
+		opt.ClashPort = 51822 // matches CLASH_PORT in entrypoint.sh / rebuild-singbox.sh
 	}
 
 	secret, err := loadOrCreateSecret(filepath.Join(opt.ConfDir, "mgmt-secret"))
@@ -110,6 +116,15 @@ func Run(opt Options) error {
 	}
 	printHandle(host, port, secret, certSha[:])
 
+	// Per-user Hysteria2 traffic + online state. WireGuard gets this from
+	// `wg show`; Hy2 only has sing-box's Clash API, so poll it and bank the
+	// totals for `stats` to read. Best-effort — never blocks serving.
+	// Tied to a signal context so a graceful stop flushes the counters instead
+	// of dropping everything since the last periodic save.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	startHy2Poller(ctx, opt.ConfDir, opt.ClashPort)
+
 	s := &server{secret: secret, confDir: opt.ConfDir, binDir: opt.BinDir}
 	srv := &http.Server{
 		Addr:              opt.Listen,
@@ -127,7 +142,20 @@ func Run(opt Options) error {
 	}
 	log.Printf("breach-mgmt: listening on %s (TCP), state=%s", opt.Listen, opt.ConfDir)
 	// Certs come from TLSConfig, so the file args are empty.
-	return srv.ListenAndServeTLS("", "")
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServeTLS("", "") }()
+
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		// Give the poller's own ctx.Done arm a moment to flush before exiting.
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	}
 }
 
 // server routes authenticated requests and serializes the mutating tool calls —

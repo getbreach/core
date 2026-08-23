@@ -235,5 +235,12 @@ is needed — egress is plain outbound.
   the dispatcher reads. For obfs, run a Hy2-only exit on its own port.
 - Adding a Hy2 user briefly bounces sing-box (auto-restarted by a wrapper); WG is
   a separate process and is untouched.
+- Per-user **Hy2** traffic and online state come from sing-box's Clash API
+  (loopback only, secret in `$CONF_DIR/clash-secret`), polled by `breach-mgmt`
+  into `$CONF_DIR/hy2_stats`, which `stats` joins with the WireGuard numbers.
+  So an image built with `MGMT=0`, or one run with `MGMT_ENABLE=0`, reports
+  zeros for Hy2 clients — WireGuard is unaffected either way. Totals are
+  integrated from a live snapshot, so a connection that opens and closes between
+  two polls is missed: good enough to show data use, not billing-grade.
 - Verified end-to-end on a real VPS (phone → MAX TURN → breach-server →
   wireguard-go/sing-box → internet), both protocols, multiple per-user keys.

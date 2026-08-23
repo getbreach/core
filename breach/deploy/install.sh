@@ -85,11 +85,52 @@ if [ "$PROTO" != hy2 ] && [ ! -e /dev/net/tun ]; then
   modprobe tun 2>/dev/null || true
   [ -e /dev/net/tun ] || die "no /dev/net/tun on this host — WireGuard can't run here; re-run with PROTO=hy2"
 fi
-if [ "$PROTO" = hy2 ]; then OVERLAY="-f docker-compose.hy2.yml"; fi
+if [ "$PROTO" = hy2 ]; then
+  # The overlay clears the WireGuard-only privileges with `!reset`, which Compose
+  # understands only from v2.24. On anything older the merge dies as an opaque
+  # YAML error, so check first and say what is actually wrong.
+  #
+  # Compare major and minor as NUMBERS. Matching "2.*" and rejecting the rest was
+  # wrong the moment Compose left 2.x behind — it turned a healthy v5 host into a
+  # hard failure.
+  CV="$($DC version --short 2>/dev/null | tr -d 'v')"
+  CV_MAJ="${CV%%.*}"
+  CV_REST="${CV#*.}"
+  CV_MIN="${CV_REST%%.*}"
+  case "$CV_MAJ.$CV_MIN" in
+    ''|*[!0-9.]*|.*|*.)
+      die "could not read the Docker Compose version (got '${CV:-empty}') — PROTO=hy2 needs v2.24+, or re-run with PROTO=both" ;;
+  esac
+  if [ "$CV_MAJ" -lt 2 ] || { [ "$CV_MAJ" -eq 2 ] && [ "$CV_MIN" -lt 24 ]; }; then
+    die "PROTO=hy2 needs Docker Compose v2.24+ for the hy2 overlay (found $CV) — upgrade docker-compose-plugin, or re-run with PROTO=both"
+  fi
+  # BOTH files, in order. `-f` REPLACES the default file list rather than adding
+  # to it, so the overlay on its own would be the entire config — and it carries
+  # no image and no ports, only the !reset clears. That fails at `up` with a
+  # service that has nothing to run.
+  OVERLAY="-f docker-compose.yml -f docker-compose.hy2.yml"
+fi
 
 # ---- image -------------------------------------------------------------------
 say "pulling $BREACH_IMAGE"
-if ! docker pull "$BREACH_IMAGE" 2>/tmp/breach-pull.err; then
+# Retry: ghcr.io serves the manifest itself but the LAYERS come from
+# pkg-containers.githubusercontent.com, and a single timed-out blob is enough to
+# fail the whole pull — on a flaky path that kills a multi-minute install for no
+# reason. Docker keeps the layers it already got, so a retry resumes rather than
+# starting over. An auth failure never fixes itself, so that one breaks out.
+PULL_OK=0
+PULL_TRY=1
+while [ "$PULL_TRY" -le 3 ]; do
+  if docker pull "$BREACH_IMAGE" 2>/tmp/breach-pull.err; then PULL_OK=1; break; fi
+  if grep -qiE 'denied|unauthorized|not found' /tmp/breach-pull.err; then break; fi
+  if [ "$PULL_TRY" -lt 3 ]; then
+    say "pull attempt $PULL_TRY failed, retrying in 5s"
+    sleep 5
+  fi
+  PULL_TRY=$((PULL_TRY+1))
+done
+
+if [ "$PULL_OK" != 1 ]; then
   # Already loaded locally (`docker save | ssh ... docker load`, or a local build)?
   # Then a failed pull is fine — an unreachable/private registry isn't fatal.
   if docker image inspect "$BREACH_IMAGE" >/dev/null 2>&1; then
@@ -109,6 +150,20 @@ too — its visibility is separate from the repo's. Either:
   * or ship the image without a registry, from your machine:
     docker save breach-exit | gzip | ssh root@thisbox 'gunzip | docker load'
     then re-run with BREACH_IMAGE=breach-exit
+EOF
+    elif grep -qiE 'i/o timeout|timed out|no route to host|connection refused|network is unreachable|TLS handshake' /tmp/breach-pull.err; then
+      cat >&2 <<EOF
+
+The registry answered but a LAYER download timed out. ghcr.io only serves the
+manifest; the blobs come from pkg-containers.githubusercontent.com
+(185.199.108-111.x), and plenty of networks block that range while ghcr.io
+itself resolves fine. Three attempts were made.
+
+  * re-run — this is often intermittent
+  * or check the box itself:  curl -sSI https://pkg-containers.githubusercontent.com
+  * or ship the image from your own machine, no registry involved:
+      docker save $BREACH_IMAGE | gzip | ssh root@$(hostname -I 2>/dev/null | awk '{print $1}') 'gunzip | docker load'
+    then re-run — a locally present image is used automatically
 EOF
     fi
     die "docker pull failed"

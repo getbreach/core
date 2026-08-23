@@ -30,11 +30,17 @@ write_wg_conf() {
   return 0
 }
 
-# Rewrite hy2_users (one password per registry entry that has one).
+# Rewrite hy2_users: "name<TAB>password" per registry entry that has a password.
+# The NAME matters beyond bookkeeping: sing-box only attributes traffic to a user
+# when the hysteria2 inbound user carries a name (an unnamed user shows up as ""
+# everywhere), so without it per-user stats are empty. Auth is keyed on the
+# password alone, so naming users cannot invalidate existing client configs.
+# Older volumes hold password-only lines; rebuild-singbox.sh reads both shapes,
+# and this rewrite (which the entrypoint runs at every boot) migrates them.
 write_hy2_users() {
   : > "$CONF_DIR/hy2_users"
   [ -f "$CONF_DIR/clients" ] || return 0
-  awk -F"$TAB" '$4 != "" { print $4 }' "$CONF_DIR/clients" >> "$CONF_DIR/hy2_users"
+  awk -F"$TAB" -v OFS="$TAB" '$4 != "" { print $1, $4 }' "$CONF_DIR/clients" >> "$CONF_DIR/hy2_users"
   return 0
 }
 

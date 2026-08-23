@@ -212,8 +212,11 @@ func ServerRemoveClient(handleJSON string, name string, p Protector) error {
 }
 
 // ServerStats returns the exit's stats JSON: {"server":{load1,mem,uptime},
-// "clients":[{name,address,rx,tx,handshake,online}, ...]} (WireGuard traffic
-// only — Hy2 per-user traffic is not reported by the exit yet).
+// "clients":[{name,address,rx,tx,handshake,online}, ...]}. rx/tx sum this
+// client's WireGuard AND Hysteria2 traffic, and online is true when either was
+// seen recently; "handshake" is the fresher of the two liveness stamps. Hy2
+// numbers require an exit built with the management API (they come from
+// sing-box's Clash API); without it Hy2 clients report zeros.
 func ServerStats(handleJSON string, p Protector) (string, error) {
 	h, err := parseHandle(handleJSON)
 	if err != nil {

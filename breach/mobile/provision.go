@@ -167,11 +167,13 @@ func ProvisionServer(optionsJSON string, p Protector, progress ProvisionProgress
 		return nil, err
 	}
 
-	var outBuf bytes.Buffer
+	// stdout is captured for PARSING (the sentinel blocks live there); stderr is
+	// captured for REPORTING — see failureTail.
+	var outBuf, errBuf bytes.Buffer
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); streamLines(stdout, progress, &outBuf) }()
-	go func() { defer wg.Done(); streamLines(stderr, progress, nil) }()
+	go func() { defer wg.Done(); streamLines(stderr, progress, &errBuf) }()
 
 	logp(progress, "installing exit (this can take a couple of minutes) …")
 	runErr := sess.Run(env + " sh -s")
@@ -188,9 +190,9 @@ func ProvisionServer(optionsJSON string, p Protector, progress ProvisionProgress
 	block := extractBetween(out, "===BREACH-CLIENT-CONFIG-BEGIN===", "===BREACH-CLIENT-CONFIG-END===")
 	if block == "" || !json.Valid([]byte(block)) {
 		if runErr != nil {
-			return nil, fmt.Errorf("install failed: %v\n%s", runErr, tail(out, 800))
+			return nil, fmt.Errorf("install failed: %v\n%s", runErr, failureTail(errBuf.String(), out))
 		}
-		return nil, fmt.Errorf("install produced no client config block\n%s", tail(out, 800))
+		return nil, fmt.Errorf("install produced no client config block\n%s", failureTail(errBuf.String(), out))
 	}
 
 	res := &ProvisionResult{ServerConfigJSON: block, HostKeyFingerprint: gotFP}
@@ -295,6 +297,18 @@ func extractBetween(s, begin, end string) string {
 		return ""
 	}
 	return strings.TrimSpace(rest[:j])
+}
+
+// failureTail picks the output an operator actually needs to see when an install
+// fails. That is stderr: `docker compose` writes its progress AND its errors
+// there, and so does install.sh's die(). stdout, by contrast, ends on the last
+// step that WORKED — reporting it alone is how "install failed: status 1"
+// arrives with a tail that reads as though everything went fine.
+func failureTail(stderrOut, stdoutOut string) string {
+	if s := strings.TrimSpace(stderrOut); s != "" {
+		return tail(s, 1200)
+	}
+	return tail(stdoutOut, 1200)
 }
 
 func tail(s string, n int) string {

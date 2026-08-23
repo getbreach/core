@@ -29,9 +29,13 @@ RELAY_LISTEN="${RELAY_LISTEN:-:48000}"
 KEEPALIVE_MS="${KEEPALIVE_MS:-50}"
 WG_PORT=51820
 HY2_PORT=51821
+# sing-box's Clash API (per-user Hy2 traffic/online state), loopback only. Fixed
+# like the two above so it can never collide with an operator-set RELAY_PORT or
+# MGMT_PORT; breach-mgmt is told the same value below.
+CLASH_PORT=51822
 CONF_DIR="${CONF_DIR:-/etc/breach}"
 mkdir -p "$CONF_DIR"
-export CONF_DIR WG_PORT HY2_PORT LOG_LEVEL
+export CONF_DIR WG_PORT HY2_PORT CLASH_PORT LOG_LEVEL
 . /usr/local/bin/breach-lib.sh
 
 case "$PROTO" in both) DO_WG=1; DO_HY2=1;; wg) DO_WG=1; DO_HY2=0;; hy2) DO_WG=0; DO_HY2=1;;
@@ -131,7 +135,8 @@ if command -v breach-mgmt >/dev/null 2>&1 && [ "${MGMT_ENABLE:-1}" != 0 ]; then
   MGMT_HOST="${PUBLIC_ENDPOINT%:*}"
   (
     while :; do
-      breach-mgmt -listen "$MGMT_LISTEN" -conf-dir "$CONF_DIR" -advertise-host "$MGMT_HOST" || true
+      breach-mgmt -listen "$MGMT_LISTEN" -conf-dir "$CONF_DIR" -advertise-host "$MGMT_HOST" \
+        -clash-port "$CLASH_PORT" || true
       sleep 2
     done
   ) & MGW=$!; PIDS="$PIDS $MGW"

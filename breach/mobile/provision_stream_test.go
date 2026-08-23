@@ -66,3 +66,21 @@ func TestStreamLinesUnterminatedBlockStaysWithheld(t *testing.T) {
 		t.Fatalf("output before the block was dropped:\n%s", shown)
 	}
 }
+
+// The reason an install failed is on stderr; stdout ends on the last step that
+// worked. Reporting stdout alone produced "install failed: status 1" followed by
+// a tail that looked like a healthy run — which is exactly what it did.
+func TestFailureTailPrefersStderr(t *testing.T) {
+	const reason = "no such attribute: !reset (needs Compose v2.24+)"
+	got := failureTail(reason, "==> starting exit (PROTO=hy2, udp/48000)")
+	if !strings.Contains(got, reason) {
+		t.Fatalf("failure tail dropped the stderr reason: %q", got)
+	}
+}
+
+func TestFailureTailFallsBackToStdout(t *testing.T) {
+	const last = "==> starting exit"
+	if got := failureTail("   \n\t ", last); !strings.Contains(got, last) {
+		t.Fatalf("with empty stderr the tail should fall back to stdout, got %q", got)
+	}
+}

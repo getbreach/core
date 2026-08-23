@@ -91,10 +91,40 @@ jobs:
           docker exec smoke sing-box version
           docker exec smoke sing-box version | grep -q 'with_quic'
           docker exec smoke sing-box version | grep -q 'with_gvisor'
+          # per-user Hy2 traffic/online state rides on the Clash API
+          docker exec smoke sing-box version | grep -q 'with_clash_api'
           docker exec smoke provision-client smoketest | tee /tmp/block
           sed -n '/CONFIG-BEGIN/,/CONFIG-END/p' /tmp/block | sed '1d;$d' | python3 -m json.tool
           docker exec smoke list-clients | python3 -m json.tool
           docker exec smoke stats | python3 -m json.tool
+          # ---- per-user Hy2 accounting wiring --------------------------------
+          # sing-box only attributes traffic to a NAMED user, and the poller can
+          # only reach the API if the config carries one. Both are silent
+          # failures (stats just stay 0), so assert the wiring explicitly.
+          docker exec smoke cat /etc/breach/hy2_users | grep -qP 'smoketest\t.+' \
+            || { echo "hy2_users lost the client name"; docker exec smoke cat /etc/breach/hy2_users; exit 1; }
+          docker exec smoke cat /etc/breach/singbox.json > /tmp/sb.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/sb.json'))
+          users = [i for i in d["inbounds"] if i["type"] == "hysteria2"][0]["users"]
+          assert any(u.get("name") == "smoketest" for u in users), users
+          api = d["experimental"]["clash_api"]
+          assert api["external_controller"] == "127.0.0.1:51822", api
+          assert api["secret"], "clash api has no secret"
+          print("hy2 users named + clash_api on loopback with a secret")
+          PY
+          # and the API must actually answer breach-mgmt with that secret.
+          # provision-client above bounced sing-box (reload_hy2 -> pkill) and the
+          # supervisor sleeps before relaunching, so poll instead of one-shot.
+          docker exec smoke sh -c '
+            for i in $(seq 30); do
+              if curl -fsS -H "Authorization: Bearer $(cat /etc/breach/clash-secret)" \
+                   http://127.0.0.1:51822/connections > /tmp/conns; then cat /tmp/conns; exit 0; fi
+              sleep 1
+            done
+            echo "clash api never came up" >&2; exit 1
+          ' | python3 -c 'import sys,json;json.load(sys.stdin);print("clash api reachable")'
           # ---- management API (breach-mgmt) end-to-end ----------------------
           # Built in by default (ARG MGMT=1) and started by default
           # (MGMT_ENABLE=1), listening on tcp/48000 inside the container. Drive

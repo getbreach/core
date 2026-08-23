@@ -66,17 +66,38 @@ RUN mkdir -p /mgmt-out \
 # go:linkname usage in tfo-go and the TLS record code.
 # Result: 31.2 MiB instead of 71.0 MiB, same behaviour for our config.
 #
-# Want per-user Hy2 traffic in `stats` later? That needs sing-box's API --
-# add `with_clash_api` (or with_v2ray_api,with_grpc) to SINGBOX_TAGS.
+# with_clash_api -> the Clash API, which is how `stats` gets per-user Hysteria2
+#                  traffic and online state (WireGuard has `wg show`; Hy2 has
+#                  nothing without an API). Costs ~0.4 MiB. breach-mgmt polls
+#                  /connections on loopback and accumulates per-user totals.
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS singbox
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG SINGBOX_VERSION=v1.13.13
-ARG SINGBOX_TAGS="with_quic,with_gvisor,badlinkname,tfogo_checklinkname0"
+ARG SINGBOX_TAGS="with_quic,with_gvisor,with_clash_api,badlinkname,tfogo_checklinkname0"
 ENV CGO_ENABLED=0 GOOS=linux
+# rebuild-singbox.sh ALWAYS emits an experimental.clash_api block, and sing-box
+# refuses to start when that key is present in a build without the tag ("clash
+# api is not included in this build"). That failure is nasty in production: the
+# container still prints its banner and the healthcheck still passes, while both
+# Hy2 and WireGuard egress are dead. Refuse to produce such an image at all.
+RUN case ",$SINGBOX_TAGS," in \
+      *,with_clash_api,*) ;; \
+      *) echo "FATAL: SINGBOX_TAGS must include with_clash_api (the generated sing-box config always sets experimental.clash_api)"; exit 1 ;; \
+    esac
 RUN apk add --no-cache git
 RUN git clone --depth 1 -b "$SINGBOX_VERSION" https://github.com/SagerNet/sing-box /sb
 WORKDIR /sb
+# The Clash API knows which Hy2 user a connection belongs to (the hysteria2
+# inbound puts it in InboundContext.User), but its JSON serializer drops the
+# field -- the metadata map it emits has nine keys and `user` is not one of them.
+# Add it, so traffic can be attributed without inferring the user from routing
+# rules. Verified after patching: a missing/renamed anchor must FAIL the build
+# rather than silently produce an image whose stats are always empty.
+RUN sed -i 's|\("processPath":[[:space:]]*processPath,\)|\1\n\t\t\t"user":            t.Metadata.User,|' \
+      experimental/clashapi/trafficontrol/tracker.go \
+ && grep -q '"user":            t.Metadata.User,' experimental/clashapi/trafficontrol/tracker.go \
+ || { echo "FATAL: clashapi tracker.go patch did not apply -- per-user Hy2 stats would be silently empty"; exit 1; }
 RUN GOARCH="$TARGETARCH" GOARM="${TARGETVARIANT#v}" \
     go build -tags "$SINGBOX_TAGS" -trimpath \
       -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${SINGBOX_VERSION#v}' \

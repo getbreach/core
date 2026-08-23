@@ -21,6 +21,7 @@ func main() {
 	confDir := flag.String("conf-dir", "/etc/breach", "state dir (mgmt secret/cert + the client registry)")
 	binDir := flag.String("bin-dir", "/usr/local/bin", "dir holding provision-client/list-clients/remove-client/stats")
 	advHost := flag.String("advertise-host", "", "public host/IP embedded in the handle URL the app connects to")
+	clashPort := flag.Int("clash-port", 51822, "sing-box Clash API port on loopback (per-user Hysteria2 traffic)")
 	flag.Parse()
 
 	if err := mgmt.Run(mgmt.Options{
@@ -28,6 +29,7 @@ func main() {
 		ConfDir:       *confDir,
 		BinDir:        *binDir,
 		AdvertiseHost: *advHost,
+		ClashPort:     *clashPort,
 	}); err != nil {
 		log.Fatalf("breach-mgmt: %v", err)
 	}
