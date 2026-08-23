@@ -39,6 +39,17 @@ RUN mkdir /wg && cd /wg && go mod init wgbuild >/dev/null \
  && go get golang.zx2c4.com/wireguard@v0.0.0-20260522210424-ecfc5a8d5446 \
  && GOARCH="$TARGETARCH" GOARM="${TARGETVARIANT#v}" \
     go build -trimpath -ldflags='-s -w' -o /out/wireguard golang.zx2c4.com/wireguard
+# Optional management API (breach-mgmt). Built ONLY when MGMT=1, into a SEPARATE
+# dir so the final stage can copy it with a single directory COPY that is a
+# no-op when the dir is empty (Docker has no conditional COPY). MGMT=0 => the
+# binary is never compiled and never lands in the image. The `mgmt` build tag
+# gates every mgmt source file, so nothing of it links into breach-server either.
+ARG MGMT=1
+RUN mkdir -p /mgmt-out \
+ && if [ "$MGMT" = "1" ]; then \
+      GOARCH="$TARGETARCH" GOARM="${TARGETVARIANT#v}" \
+      go build -tags mgmt -trimpath -ldflags='-s -w' -o /mgmt-out/breach-mgmt ./cmd/mgmt; \
+    else echo "MGMT=$MGMT — breach-mgmt omitted from image"; fi
 
 # --- build a MINIMAL sing-box (version still matches SINGBOX_PIVOT.md) --------
 # The official binary carries every protocol and service sing-box supports
@@ -88,6 +99,8 @@ RUN apk add --no-cache wireguard-tools-wg iproute2-minimal iptables openssl proc
 COPY --from=build   /out/breach-server      /usr/local/bin/breach-server
 COPY --from=build   /out/wireguard          /usr/local/bin/wireguard-go
 COPY --from=singbox /out/sing-box           /usr/local/bin/sing-box
+# breach-mgmt if built (empty dir => copies nothing when MGMT=0).
+COPY --from=build   /mgmt-out/              /usr/local/bin/
 COPY deploy/entrypoint.sh        /usr/local/bin/entrypoint.sh
 COPY deploy/breach-lib.sh        /usr/local/bin/breach-lib.sh
 COPY deploy/provision-client.sh  /usr/local/bin/provision-client

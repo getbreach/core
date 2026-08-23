@@ -33,6 +33,11 @@ HY2_SNI="${HY2_SNI:-www.bing.com}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 PUBLIC_ENDPOINT="${PUBLIC_ENDPOINT:-}"
 KEEPALIVE_MS="${KEEPALIVE_MS:-50}"
+MGMT_ENABLE="${MGMT_ENABLE:-1}"
+# Normalize to 0/1 so this script agrees with entrypoint.sh's `!= 0` test.
+case "$MGMT_ENABLE" in 0|false|no|off|"") MGMT_ENABLE=0;; *) MGMT_ENABLE=1;; esac
+# mgmt shares the relay port number by default; open/publish whatever it binds.
+MGMT_PORT="${MGMT_PORT:-$RELAY_PORT}"
 BREACH_IMAGE="${BREACH_IMAGE:-ghcr.io/getbreach/breach-exit:latest}"
 DIR="${DIR:-/opt/breach}"
 CLIENT="${CLIENT-client1}"
@@ -136,19 +141,26 @@ PUBLIC_ENDPOINT=$PUBLIC_ENDPOINT
 HY2_SNI=$HY2_SNI
 LOG_LEVEL=$LOG_LEVEL
 KEEPALIVE_MS=$KEEPALIVE_MS
+MGMT_ENABLE=$MGMT_ENABLE
+MGMT_PORT=$MGMT_PORT
 EOF
 fi
 
 # ---- firewall ----------------------------------------------------------------
+# The relay needs udp/$RELAY_PORT; the management API (if enabled) needs
+# tcp/$RELAY_PORT. Both must ALSO be opened in the VPS provider's own firewall.
+MGMT_FW=""; [ "$MGMT_ENABLE" = 1 ] && MGMT_FW=" + tcp/$MGMT_PORT (mgmt)"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-  say "ufw: allowing $RELAY_PORT/udp"
+  say "ufw: allowing udp/$RELAY_PORT$MGMT_FW"
   ufw allow "$RELAY_PORT/udp" >/dev/null || true
+  [ "$MGMT_ENABLE" = 1 ] && ufw allow "$MGMT_PORT/tcp" >/dev/null || true
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  say "firewalld: allowing $RELAY_PORT/udp"
+  say "firewalld: allowing udp/$RELAY_PORT$MGMT_FW"
   firewall-cmd --permanent --add-port="$RELAY_PORT/udp" >/dev/null || true
+  [ "$MGMT_ENABLE" = 1 ] && firewall-cmd --permanent --add-port="$MGMT_PORT/tcp" >/dev/null || true
   firewall-cmd --reload >/dev/null || true
 else
-  say "no active ufw/firewalld — make sure udp/$RELAY_PORT is open (also in the VPS provider's panel)"
+  say "no active ufw/firewalld — make sure udp/$RELAY_PORT$MGMT_FW is open (also in the VPS provider's panel)"
 fi
 
 # ---- run ---------------------------------------------------------------------
@@ -170,6 +182,25 @@ if [ -n "$CLIENT" ]; then
   say "provisioning client '$CLIENT'"
   docker exec breach-exit provision-client "$CLIENT" || \
     say "provisioning failed (client may already exist) — run: docker exec breach-exit provision-client <name>"
+fi
+
+# ---- management handle --------------------------------------------------------
+# Emitted (with the same sentinel convention as the client block) so the app's
+# one-tap provisioner can slice it out of this script's output, and a human can
+# copy it. It carries the API secret — treat it like a password.
+if [ "$MGMT_ENABLE" = 1 ]; then
+  HJSON=""
+  for _ in $(seq 15); do
+    HJSON="$(docker exec breach-exit cat /etc/breach/mgmt.json 2>/dev/null || true)"
+    [ -n "$HJSON" ] && break
+    sleep 1
+  done
+  if [ -n "$HJSON" ]; then
+    say "management handle (lets the app manage this exit WITHOUT SSH — keep it secret):"
+    echo "===BREACH-MGMT-BEGIN==="
+    echo "$HJSON"
+    echo "===BREACH-MGMT-END==="
+  fi
 fi
 
 cat <<EOF

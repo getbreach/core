@@ -15,6 +15,8 @@ on:
       # deps, or this workflow. Client-only changes (cmd/client, maxproto, turn,
       # mobile) don't ship in the image, so they don't trigger a rebuild.
       - 'breach/cmd/server/**'
+      - 'breach/cmd/mgmt/**'
+      - 'breach/mgmt/**'
       - 'breach/media/**'
       - 'breach/dtlscfg/**'
       - 'breach/deploy/**'
@@ -93,6 +95,31 @@ jobs:
           sed -n '/CONFIG-BEGIN/,/CONFIG-END/p' /tmp/block | sed '1d;$d' | python3 -m json.tool
           docker exec smoke list-clients | python3 -m json.tool
           docker exec smoke stats | python3 -m json.tool
+          # ---- management API (breach-mgmt) end-to-end ----------------------
+          # Built in by default (ARG MGMT=1) and started by default
+          # (MGMT_ENABLE=1), listening on tcp/48000 inside the container. Drive
+          # the full add/list/remove path THROUGH the pinned-TLS API, and prove a
+          # wrong secret is rejected.
+          docker exec smoke sh -c 'command -v breach-mgmt'
+          for _ in $(seq 20); do docker exec smoke test -f /etc/breach/mgmt.json && break; sleep 1; done
+          H="$(docker exec smoke cat /etc/breach/mgmt.json)"; echo "$H" | python3 -m json.tool
+          docker logs smoke 2>&1 | grep -q 'BREACH-MGMT-BEGIN'
+          P="$(echo "$H" | python3 -c 'import sys,json;print(json.load(sys.stdin)["port"])')"
+          S="$(echo "$H" | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"])')"
+          BASE="https://127.0.0.1:$P/$S"
+          docker exec smoke curl -fsS --insecure "$BASE/health" | python3 -m json.tool
+          docker exec smoke curl -fsS --insecure -H 'Content-Type: application/json' \
+            -d '{"name":"apitest"}' "$BASE/clients" \
+            | python3 -c 'import sys,json;assert json.load(sys.stdin)["config"]["name"]=="apitest"'
+          docker exec smoke list-clients \
+            | python3 -c 'import sys,json;assert any(c["name"]=="apitest" for c in json.load(sys.stdin))'
+          docker exec smoke curl -fsS --insecure -X DELETE "$BASE/clients/apitest" | python3 -m json.tool
+          docker exec smoke list-clients \
+            | python3 -c 'import sys,json;assert all(c["name"]!="apitest" for c in json.load(sys.stdin))'
+          # a bad secret must 404 (curl -f => non-zero); success here is a failure
+          if docker exec smoke curl -fsS --insecure "https://127.0.0.1:$P/wrongsecret/health"; then
+            echo "mgmt accepted a wrong secret!"; exit 1
+          fi
           # the deployment files must ride inside the image (install.sh extracts
           # them from here instead of raw.githubusercontent, so a private repo works)
           for f in docker-compose.yml docker-compose.hy2.yml .env.example install.sh; do

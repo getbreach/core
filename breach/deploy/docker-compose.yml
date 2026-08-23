@@ -26,6 +26,13 @@ services:
     init: true
     ports:
       - "${RELAY_PORT:-48000}:${RELAY_PORT:-48000}/udp"
+      # Management API (breach-mgmt), TCP. Guarded by a per-server secret + pinned
+      # TLS. Harmless when the image has no mgmt binary or MGMT_ENABLE=0 (nothing
+      # listens). Delete this line to make the exit unmanageable from the app
+      # (SSH-only). install.sh writes MGMT_PORT=RELAY_PORT into .env so mgmt shares
+      # the relay port number; set MGMT_PORT to move it. (Single-level default so
+      # legacy docker-compose v1 also expands it.)
+      - "${MGMT_PORT:-48000}:${MGMT_PORT:-48000}/tcp"
     volumes:
       # State: server keys, client registry, Hy2 cert. Survives restarts and
       # image upgrades — the exit keeps its identity, clients keep working.
@@ -39,6 +46,10 @@ services:
       # Advertised to clients. Empty -> autodetected via api.ipify.org at first
       # boot and frozen in the volume's `meta`.
       PUBLIC_ENDPOINT: ${PUBLIC_ENDPOINT:-}
+      # Management API: 1 (default) starts breach-mgmt when the image includes it;
+      # 0 keeps the exit SSH-only. Listens on the TCP port published above.
+      MGMT_ENABLE: ${MGMT_ENABLE:-1}
+      MGMT_LISTEN: ":${MGMT_PORT:-48000}"
     # Required by the WireGuard half (PROTO=both|wg): wireguard-go needs a real
     # tun, and forwarding must be on inside the netns. Harmless for PROTO=hy2,
     # but if the host has no /dev/net/tun, use the hy2-only override below.

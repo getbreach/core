@@ -111,6 +111,27 @@ fi
 
 echo "breach-exit: PROTO=$PROTO relay=$RELAY_LISTEN endpoint=$PUBLIC_ENDPOINT dev=$DEV (state=$CONF_DIR)"
 
+# ---- management API (optional) ----------------------------------------------
+# breach-mgmt is a fixed-verb HTTPS wrapper over provision/list/remove/stats,
+# guarded by a per-server secret + pinned self-signed TLS, so the app can manage
+# the exit after install WITHOUT keeping SSH root creds. It is present only when
+# the image was built with --build-arg MGMT=1, and started only when
+# MGMT_ENABLE!=0. It listens on TCP (same port number as the UDP relay by
+# default) but is reachable from outside ONLY if that TCP port is published
+# (docker-compose maps it). Restart-supervised in its own subshell so a mgmt
+# crash self-heals instead of taking the whole exit down. On start it prints a
+# ===BREACH-MGMT-BEGIN===/END=== handle block (install.sh slices it from logs).
+if command -v breach-mgmt >/dev/null 2>&1 && [ "${MGMT_ENABLE:-1}" != 0 ]; then
+  MGMT_LISTEN="${MGMT_LISTEN:-:${RELAY_LISTEN##*:}}"
+  MGMT_HOST="${PUBLIC_ENDPOINT%:*}"
+  (
+    while :; do
+      breach-mgmt -listen "$MGMT_LISTEN" -conf-dir "$CONF_DIR" -advertise-host "$MGMT_HOST" || true
+      sleep 2
+    done
+  ) & MGW=$!; PIDS="$PIDS $MGW"
+fi
+
 # shellcheck disable=SC2086
 breach-server -listen "$RELAY_LISTEN" $WG_FLAG $HY2_FLAG -keepalive-ms "$KEEPALIVE_MS" & MT=$!; PIDS="$PIDS $MT"
 
