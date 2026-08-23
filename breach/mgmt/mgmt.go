@@ -165,6 +165,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleAdd(w, r)
 	case rest == "stats" && r.Method == http.MethodGet:
 		s.handleStats(w, r)
+	case rest == "routes" && r.Method == http.MethodPut:
+		s.handleRoutes(w, r)
 	case strings.HasPrefix(rest, "clients/") && r.Method == http.MethodDelete:
 		s.handleRemove(w, r, strings.TrimPrefix(rest, "clients/"))
 	default:
@@ -206,6 +208,48 @@ func (s *server) handleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"config": json.RawMessage(block)})
+}
+
+// handleRoutes replaces the exit's server-side routing policy — the same thing
+// `set-routes` does by hand. The body is {"route": <sing-box "route" object>} to
+// apply one, or {"clear": true} to go back to passthrough.
+//
+// The object never reaches a shell: it is base64-encoded here and set-routes
+// decodes it straight to a file, exactly as it is invoked manually. This adds no
+// capability the secret did not already have (it can create and delete VPN users
+// already) — but note a bad policy can cut the exit off from the internet, and
+// fixing that needs SSH.
+func (s *server) handleRoutes(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Route json.RawMessage `json:"route"`
+		Clear bool            `json:"clear"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad JSON body")
+		return
+	}
+	arg := "clear"
+	if !body.Clear {
+		// Must be a JSON OBJECT: set-routes writes it as sing-box's "route", and a
+		// bare array/string would only fail later, inside sing-box, as a restart loop.
+		// `null` unmarshals into a map without error and leaves it nil, so the nil
+		// check is what actually rejects it.
+		var probe map[string]json.RawMessage
+		if len(body.Route) == 0 || json.Unmarshal(body.Route, &probe) != nil || probe == nil {
+			writeErr(w, http.StatusBadRequest, `body must be {"route":{…}} or {"clear":true}`)
+			return
+		}
+		arg = base64.StdEncoding.EncodeToString(body.Route)
+	}
+
+	s.mu.Lock()
+	_, stderr, err := s.run("set-routes", arg)
+	s.mu.Unlock()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "set-routes failed: "+firstLine(stderr))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied": !body.Clear})
 }
 
 // handleRemove revokes a client. `name` is the trailing path segment.

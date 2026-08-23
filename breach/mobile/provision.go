@@ -234,19 +234,54 @@ func sshAuths(opt *provisionOpts) ([]ssh.AuthMethod, error) {
 	return auths, nil
 }
 
+// secretBlocks are the sentinel-delimited payloads the installer prints: the
+// client's provision block (WireGuard/Hy2 keys) and the management handle (an
+// admin-grade secret). They are meant to be PARSED, not read — and the progress
+// stream goes straight to a UI log that a user will screenshot when something
+// goes wrong. So they are captured for parsing and withheld from progress.
+var secretBlocks = [...][2]string{
+	{"===BREACH-CLIENT-CONFIG-BEGIN===", "===BREACH-CLIENT-CONFIG-END==="},
+	{"===BREACH-MGMT-BEGIN===", "===BREACH-MGMT-END==="},
+}
+
 func streamLines(r io.Reader, progress ProvisionProgress, capture *bytes.Buffer) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Non-empty while inside a secret block; holds the terminator to watch for.
+	var suppressUntil string
 	for sc.Scan() {
 		line := sc.Text()
 		if capture != nil {
 			capture.WriteString(line)
 			capture.WriteByte('\n')
 		}
-		if progress != nil {
-			progress.Line(line)
+		if progress == nil {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if suppressUntil != "" {
+			if trimmed == suppressUntil {
+				suppressUntil = ""
+				progress.Line("(withheld — see the app)")
+			}
+			continue
+		}
+		if b := blockStarting(trimmed); b != nil {
+			suppressUntil = b[1]
+			continue
+		}
+		progress.Line(line)
+	}
+}
+
+func blockStarting(trimmed string) *[2]string {
+	for i := range secretBlocks {
+		if trimmed == secretBlocks[i][0] {
+			return &secretBlocks[i]
 		}
 	}
+	return nil
 }
 
 func extractBetween(s, begin, end string) string {

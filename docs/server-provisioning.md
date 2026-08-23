@@ -10,7 +10,7 @@ forever after.
 │      │ ───────────────────►│ install.sh│  Docker + breach-exit + breach-mgmt
 │      │ ◄─── handle ────────│           │  {url, secret, certSha256}
 │      │                     └───────────┘
-│      │   HTTPS (pinned) — add/list/remove/stats, no SSH
+│      │   HTTPS (pinned) — add/list/remove/stats/routes, no SSH
 │      │ ───────────────────► breach-mgmt (tcp/48000)
 └──────┘
 ```
@@ -91,6 +91,7 @@ ServerAddClient(handleJSON, name string, p Protector) (string, error)     // →
 ServerListClients(handleJSON string, p Protector) (string, error)         // [{name,address,wg,hy2}]
 ServerRemoveClient(handleJSON, name string, p Protector) error
 ServerStats(handleJSON string, p Protector) (string, error)               // {server:{…}, clients:[…]}
+ServerSetRoutes(handleJSON, routeJSON string, p Protector) error          // "" clears the policy
 ```
 
 ```kotlin
@@ -101,19 +102,31 @@ Breachmobile.serverRemoveClient(handleJSON, "tablet", null)           // revoke
 
 Client `name`: `1–32` of `A–Z a–z 0–9 _ -` (enforced app- and server-side).
 
-> **Retiring the old JSch `SshAdmin`.** The Kotlin `SshAdmin` (JSch) did every op
-> over raw SSH and its block delimiters are stale (`MAXTUN-…` vs the current
-> `BREACH-…`). Replace it with `ProvisionServer` (setup) + the handle API
-> (ongoing). If you must keep it, fix the delimiter constants to `BREACH-`.
+> **The old JSch `SshAdmin` is gone.** The Android client deleted it (and the JSch
+> dependency) in favour of `ProvisionServer` for setup plus the handle API for
+> everything after; see `android/app/src/main/java/pw/komet/breach/data/ServerAdmin.kt`.
+> Servers added before the handle existed have none, and are shown as
+> "management unavailable — deploy again" rather than silently failing.
 
 ---
 
 ## 3. The server side: `breach-mgmt`
 
 A fixed-verb HTTPS service inside the exit container that wraps the same
-`provision-client`/`list-clients`/`remove-client`/`stats` tools. **Not** a remote
-shell — a leaked secret can only add/remove a VPN user or read stats, never run
-an arbitrary command or gain root.
+`provision-client`/`list-clients`/`remove-client`/`stats`/`set-routes` tools.
+**Not** a remote shell — a leaked secret can only add/remove a VPN user, read
+stats or set the egress policy, never run an arbitrary command or gain root.
+
+Verbs: `GET /health`, `GET|POST /clients`, `DELETE /clients/<name>`,
+`GET /stats`, `PUT /routes`.
+
+`PUT /routes` takes `{"route": <sing-box "route" object>}` or `{"clear": true}`
+and hands the object to `set-routes` base64-encoded, so nothing in it reaches a
+shell. It is NEWER than the other verbs: an exit installed from an image built
+before it answers `404 no such endpoint`, which the app reports as "redeploy to
+enable this" rather than pretending the policy was applied. Note that a
+block-everything policy can cut the exit off from the internet, and undoing that
+needs SSH.
 
 - **Auth**: a 32-byte secret in the URL path (constant-time compared) over a
   **pinned self-signed TLS cert**. No CA. The app pins `certSha256`.

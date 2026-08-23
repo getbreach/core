@@ -229,3 +229,37 @@ func ServerStats(handleJSON string, p Protector) (string, error) {
 	}
 	return string(data), nil
 }
+
+// ServerSetRoutes replaces the exit's SERVER-SIDE routing policy: what the exit
+// itself is allowed to reach on behalf of every client (e.g. block ads, or block
+// everything except a whitelist). routeJSON is a sing-box "route" object; pass ""
+// to clear the policy and let everything through.
+//
+// This is the exit's policy, not the phone's — the app's own routing rules are a
+// separate thing that never leaves the device.
+//
+// Needs an exit image built after the mgmt API grew this verb; an older one
+// answers 404 ("no such endpoint").
+func ServerSetRoutes(handleJSON string, routeJSON string, p Protector) error {
+	h, err := parseHandle(handleJSON)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"clear": true}
+	if routeJSON != "" {
+		// A JSON object, not just valid JSON: `null` and a bare array both decode
+		// here without error but are not a sing-box "route", and would only fail
+		// on the exit, as a sing-box that no longer starts.
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(routeJSON), &probe); err != nil || probe == nil {
+			return fmt.Errorf("route must be a JSON object")
+		}
+		body = map[string]any{"route": json.RawMessage(routeJSON)}
+	}
+	c, err := mgmtClient(h, p)
+	if err != nil {
+		return err
+	}
+	_, err = mgmtDo(c, http.MethodPut, h.URL+"/routes", body)
+	return err
+}

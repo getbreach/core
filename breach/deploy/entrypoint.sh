@@ -70,7 +70,12 @@ if [ "$DO_HY2" = 1 ] && [ ! -f "$CONF_DIR/cert.pem" ]; then
 fi
 
 PIDS=""
-WG_FLAG=""
+# breach-server's -wg defaults to 127.0.0.1:51820, so NOT passing the flag leaves
+# a phantom WireGuard backend enabled on a hy2-only exit: the banner advertises
+# it and a non-QUIC first packet gets dispatched to a port nothing listens on.
+# "-wg=" is one word (survives the unquoted splice below) and parses as empty,
+# which disables the backend outright. The DO_WG branch overrides it.
+WG_FLAG="-wg="
 HY2_FLAG=""
 
 # ---- WireGuard bring-up (config derived from the registry) -------------------

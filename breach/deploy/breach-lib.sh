@@ -10,18 +10,23 @@ registry_max_ip() {
   awk -F"$TAB" '{n=$3; sub(/.*\./,"",n); if (n+0>m) m=n+0} END{print m+0}' "$CONF_DIR/clients" 2>/dev/null
 }
 
+# Both writers parse the registry with awk, NOT `while IFS="$TAB" read`. A tab is
+# an IFS *whitespace* character, so the shell collapses runs of tabs into one
+# delimiter and drops leading/trailing ones: an Hy2-only row
+# ("name<TAB><TAB><TAB>password", i.e. empty wg fields) is then read as
+# name=name pub=password ip="" pw="", which silently wrote an EMPTY hy2_users
+# (every client then failed Hy2 auth) and could emit a [Peer] whose PublicKey was
+# actually a password. awk -F"$TAB" splits on every tab and keeps empty fields.
+
 # Rewrite wg0.conf (interface + one [Peer] per registry entry that has a pubkey).
 write_wg_conf() {
   [ -f "$CONF_DIR/server.key" ] || return 0
   psk="$(cat "$CONF_DIR/psk" 2>/dev/null)"
   { echo "[Interface]"; echo "PrivateKey = $(cat "$CONF_DIR/server.key")"; echo "ListenPort = ${WG_PORT:-51820}"; } > "$CONF_DIR/wg0.conf"
   [ -f "$CONF_DIR/clients" ] || return 0
-  while IFS="$TAB" read -r name pub ip pw; do
-    [ -z "$pub" ] && continue
-    { echo; echo "# $name"; echo "[Peer]"; echo "PublicKey = $pub"; echo "PresharedKey = $psk"; echo "AllowedIPs = $ip/32"; } >> "$CONF_DIR/wg0.conf"
-  done < "$CONF_DIR/clients"
-  # A while-read loop ends with read's non-zero EOF status; return 0 so a caller
-  # under `set -e` (e.g. provision-client) is not killed before its next step.
+  awk -F"$TAB" -v psk="$psk" '$2 != "" {
+        printf "\n# %s\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n", $1, $2, psk, $3
+      }' "$CONF_DIR/clients" >> "$CONF_DIR/wg0.conf"
   return 0
 }
 
@@ -29,10 +34,8 @@ write_wg_conf() {
 write_hy2_users() {
   : > "$CONF_DIR/hy2_users"
   [ -f "$CONF_DIR/clients" ] || return 0
-  while IFS="$TAB" read -r name pub ip pw; do
-    [ -n "$pw" ] && printf '%s\n' "$pw" >> "$CONF_DIR/hy2_users"
-  done < "$CONF_DIR/clients"
-  return 0 # see write_wg_conf: don't leak the loop's EOF status under `set -e`
+  awk -F"$TAB" '$4 != "" { print $4 }' "$CONF_DIR/clients" >> "$CONF_DIR/hy2_users"
+  return 0
 }
 
 # Reload sing-box with the current hy2_users (auto-restart wrapper relaunches it).
