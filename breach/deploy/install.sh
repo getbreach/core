@@ -19,7 +19,9 @@
 #   sudo GH_USER=you GH_TOKEN=ghp_xxx sh install.sh
 #
 # Env (all optional):
-#   PROTO=both|wg|hy2   RELAY_PORT=48000   HY2_SNI=www.bing.com
+#   PROTO=<list>        RELAY_PORT=48000   HY2_SNI=www.bing.com
+#     comma-separated: wg, hy2, socks (both = wg,hy2; all = every one)
+#     e.g. PROTO=hy2,socks  — no tun, no caps, and a client that needs no root
 #   PUBLIC_ENDPOINT=ip:port                LOG_LEVEL=info
 #   CLIENT=<name>       first client to provision (default: client1; "" to skip)
 #   BREACH_IMAGE=ghcr.io/getbreach/breach-exit:latest
@@ -48,7 +50,23 @@ say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo sh install.sh)"
-case "$PROTO" in both|wg|hy2) ;; *) die "PROTO must be both|wg|hy2 (got '$PROTO')";; esac
+
+# PROTO is a comma-separated list (see the entrypoint): wg, hy2, socks, plus the
+# shorthands both (=wg,hy2) and all. Two things downstream depend on WHICH ones
+# were asked for, so resolve it once here: WireGuard is the only one needing a
+# tun and NET_ADMIN, and the capless compose overlay applies exactly when it is
+# absent.
+PROTO="$(printf '%s' "$PROTO" | tr -d ' ')"
+WANT_WG=0
+OLDIFS="$IFS"; IFS=','
+for tok in $PROTO; do
+  case "$tok" in
+    wg|both|all) WANT_WG=1 ;;
+    hy2|socks|"") ;;
+    *) IFS="$OLDIFS"; die "unknown protocol '$tok' in PROTO='$PROTO' (want wg, hy2, socks; both = wg,hy2; all = every one)" ;;
+  esac
+done
+IFS="$OLDIFS"
 
 # ---- docker ------------------------------------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
@@ -81,11 +99,11 @@ fi
 
 # ---- tun sanity (WireGuard half only) -----------------------------------------
 OVERLAY=""
-if [ "$PROTO" != hy2 ] && [ ! -e /dev/net/tun ]; then
+if [ "$WANT_WG" = 1 ] && [ ! -e /dev/net/tun ]; then
   modprobe tun 2>/dev/null || true
-  [ -e /dev/net/tun ] || die "no /dev/net/tun on this host — WireGuard can't run here; re-run with PROTO=hy2"
+  [ -e /dev/net/tun ] || die "no /dev/net/tun on this host — WireGuard can't run here; re-run without wg in PROTO (e.g. PROTO=hy2 or PROTO=hy2,socks)"
 fi
-if [ "$PROTO" = hy2 ]; then
+if [ "$WANT_WG" = 0 ]; then
   # The overlay clears the WireGuard-only privileges with `!reset`, which Compose
   # understands only from v2.24. On anything older the merge dies as an opaque
   # YAML error, so check first and say what is actually wrong.
@@ -182,7 +200,7 @@ extract() { # extract <name> — keep an existing file, never clobber local edit
   [ -s "$1" ] || { rm -f "$1"; die "extracted an empty $1 from $BREACH_IMAGE"; }
 }
 extract docker-compose.yml
-if [ "$PROTO" = hy2 ]; then extract docker-compose.hy2.yml; fi
+if [ "$WANT_WG" = 0 ]; then extract docker-compose.hy2.yml; fi
 
 if [ -f .env ]; then
   say "keeping existing .env (delete it to re-seed from env vars)"

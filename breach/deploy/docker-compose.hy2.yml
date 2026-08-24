@@ -13,8 +13,10 @@
 
 services:
   breach-exit:
-    environment:
-      PROTO: hy2
+    # Deliberately does NOT set PROTO. It used to pin PROTO=hy2, which silently
+    # overrode the operator's choice: `PROTO=socks` or `PROTO=hy2,socks` installs
+    # came up as plain hy2, with stream mode simply absent and no error anywhere.
+    # This overlay's only job is dropping the WireGuard-only privileges.
     cap_add: !reset []
     devices: !reset []
     sysctls: !reset {}

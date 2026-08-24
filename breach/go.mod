@@ -18,6 +18,7 @@ require (
 	github.com/pion/rtcp v1.2.16 // indirect
 	github.com/pion/transport/v2 v2.2.4 // indirect
 	github.com/pion/transport/v4 v4.0.2 // indirect
+	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

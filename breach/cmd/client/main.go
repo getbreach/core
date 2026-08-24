@@ -68,6 +68,10 @@ func (p *pool) pick() *stream {
 // clientID tags every upstream packet so one server can demux multiple clients.
 var clientID [8]byte
 
+// socksIn is non-nil only in stream mode: downstream payloads go to QUIC
+// instead of the local UDP mouth.
+var socksIn chan []byte
+
 var (
 	wgConn      *net.UDPConn
 	wgClient    atomic.Pointer[net.UDPAddr]
@@ -92,6 +96,11 @@ func main() {
 	sessionPath := flag.String("session", "", "session file: -login writes it, and a later run loads the token from it instead of -config")
 	device := flag.String("device", "", `-login: spoof cosmetic device info, JSON e.g. '{"deviceName":"samsung SM-S918B","osVersion":"Android 14","screen":"480dpi 480dpi 1440x3088"}' (appVersion/arch stay locked)`)
 	dnsFlag := flag.String("dns", "", "resolver for the MAX API host (default 1.1.1.1:53 or config \"dns\")")
+	socksListen := flag.String("socks", "", "serve SOCKS5 here instead of the UDP mouth: the exit dials out itself, so no WireGuard/sing-box and no root (e.g. 127.0.0.1:1080)")
+	socksToken := flag.String("socks-token", "", "this client's password on the exit (stream mode)")
+	socksPin := flag.String("socks-pin", "", "sha256 of the exit's stream-mode certificate, from its /etc/breach/qtun-pin")
+	socksUser := flag.String("socks-user", "", "optional username for the local SOCKS5 listener")
+	socksPass := flag.String("socks-pass", "", "optional password for the local SOCKS5 listener")
 	flag.BoolVar(&maxproto.Verbose, "v", false, "verbose")
 	flag.Parse()
 
@@ -147,16 +156,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve server: %v", err)
 	}
-	laddr, err := net.ResolveUDPAddr("udp", wgl)
-	if err != nil {
-		log.Fatalf("resolve wg-listen: %v", err)
+	streamMode := *socksListen != ""
+	if streamMode {
+		// Downstream goes to QUIC, not to a local socket. Must be in place before
+		// buildPool, which starts the per-allocation readers.
+		socksIn = make(chan []byte, 1024)
+	} else {
+		laddr, err := net.ResolveUDPAddr("udp", wgl)
+		if err != nil {
+			log.Fatalf("resolve wg-listen: %v", err)
+		}
+		wgConn, err = net.ListenUDP("udp", laddr)
+		if err != nil {
+			log.Fatalf("listen %s: %v", wgl, err)
+		}
+		wgConn.SetReadBuffer(16 << 20)
+		wgConn.SetWriteBuffer(16 << 20)
 	}
-	wgConn, err = net.ListenUDP("udp", laddr)
-	if err != nil {
-		log.Fatalf("listen %s: %v", wgl, err)
-	}
-	wgConn.SetReadBuffer(16 << 20)
-	wgConn.SetWriteBuffer(16 << 20)
 
 	kaInterval := time.Duration(*kaMs) * time.Millisecond
 	p := &pool{}
@@ -173,6 +189,14 @@ func main() {
 				upCount.Load(), turn.SentPackets.Load(), downAll.Load(), downRTP.Load(), downDecFail.Load(), downData.Load())
 		}
 	}()
+
+	if streamMode {
+		log.Printf("breach-client: %d allocations up, server=%s", len(p.snapshot()), srv)
+		if err := runSocksMode(p, peer, *socksListen, *socksToken, *socksPin, *socksUser, *socksPass); err != nil {
+			log.Fatalf("socks: %v", err)
+		}
+		return
+	}
 
 	log.Printf("breach-client: %d allocations up, wg-listen=%s server=%s", len(p.snapshot()), wgl, srv)
 
@@ -275,6 +299,16 @@ func startReader(s *stream) {
 				continue
 			}
 			downData.Add(1)
+			if socksIn != nil {
+				// Copy: payload aliases the reader's buffer, which is reused.
+				pkt := make([]byte, len(payload))
+				copy(pkt, payload)
+				select {
+				case socksIn <- pkt:
+				default: // receiver is behind; QUIC recovers from a lost datagram
+				}
+				continue
+			}
 			if c := wgClient.Load(); c != nil {
 				wgConn.WriteToUDP(payload, c)
 			}

@@ -15,8 +15,22 @@ import (
 // dial: it is additive, so every other host still validates against the system
 // roots as usual.
 //
-// Ported from kolibri-net/src/transport/tls.rs. Same PEM, extracted from
-// ru.oneme.app v26.23.1 (res/raw/rootca_ssl_rsa2022.cer).
+// Ported from kolibri-net/src/transport/tls.rs. Same PEM.
+//
+// Provenance of the two anchors in mincifry_ca.pem, kept HERE rather than in
+// the .pem itself: the PEM is go:embed'ed, so anything written in it ships
+// verbatim inside the client binary, where a note about which app it was taken
+// from is both useless at runtime and a free hint to anyone unpacking the APK.
+// Go comments never reach the binary.
+//
+//	Russian Trusted Root CA — CN=Russian Trusted Root CA, serial 1000,
+//	  2022-03-01..2032-02-27
+//	  SHA-256(DER) D2:6D:2D:02:31:B7:C3:9F:92:CC:73:85:12:BA:54:10:35:19:E4:40:
+//	               5D:68:B5:BD:70:3E:97:88:CA:8E:CF:31
+//	Russian Trusted Sub CA — CN=Russian Trusted Sub CA, serial 1005,
+//	  2024-07-15..2029-07-19, issued by the root above
+//	  SHA-256(DER) 21:55:78:50:36:C9:00:DB:B5:F1:BB:2A:15:69:C8:0C:55:59:5B:D6:
+//	               BF:94:86:7A:29:BB:DD:BC:7D:88:A3:F2
 
 //go:embed mincifry_ca.pem
 var mincifryCAPEM []byte

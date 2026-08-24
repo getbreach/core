@@ -160,6 +160,73 @@ jobs:
           docker exec smoke pgrep -f 'sing-box run' >/dev/null
           docker rm -f smoke
 
+      - name: Smoke test (stream mode — one binary, no sing-box, no caps)
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -eux
+          # PROTO=socks is the mode that makes the exit a SINGLE binary: no
+          # sing-box, no wireguard-go, no caps, no extra port. What has to hold is
+          # that breach-server comes up alone, publishes its certificate pin, and
+          # that provisioning hands a client the token+pin it needs to connect.
+          # Also exercises PROTO as a LIST: hy2,socks must bring up sing-box AND
+          # stream mode, capless, on one port.
+          docker run -d --name smoke3 --init \
+            -e PROTO=socks -e PUBLIC_ENDPOINT=203.0.113.1:48000 "$REF"
+          for _ in $(seq 40); do
+            docker logs smoke3 2>&1 | grep -q 'breach-exit: PROTO=socks' && break
+            sleep 1
+          done
+          docker logs smoke3
+          docker exec smoke3 pgrep -f breach-server >/dev/null
+          # Nothing else may be running: that is the whole point of this mode.
+          if docker exec smoke3 pgrep -f 'sing-box run' >/dev/null 2>&1; then
+            echo "sing-box is running in stream mode"; exit 1
+          fi
+          if docker exec smoke3 pgrep -f wireguard-go >/dev/null 2>&1; then
+            echo "wireguard-go is running in stream mode"; exit 1
+          fi
+          docker logs smoke3 2>&1 | grep -q 'stream mode on 127.0.0.1:51823'
+          docker exec smoke3 test -s /etc/breach/qtun-pin
+          docker exec smoke3 provision-client streamtest | tee /tmp/sblock
+          sed -n '/CONFIG-BEGIN/,/CONFIG-END/p' /tmp/sblock | sed '1d;$d' > /tmp/sblock.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/sblock.json'))
+          assert d["wireguard"] is None, d
+          assert d["hysteria2"] is None, d
+          s = d["socks5"]
+          assert s and s["token"], d
+          assert len(s["certSha256"]) == 64, d
+          print("stream-mode client block carries a token and a 32-byte pin")
+          PY
+          [ "$(docker inspect -f '{{.State.Running}}' smoke3)" = true ]
+          docker rm -f smoke3
+
+          # A LIST: hy2 and socks together, still capless, still one port.
+          docker run -d --name smoke4 --init \
+            -e PROTO=hy2,socks -e PUBLIC_ENDPOINT=203.0.113.1:48000 "$REF"
+          for _ in $(seq 40); do
+            docker logs smoke4 2>&1 | grep -q 'breach-exit: PROTO=hy2,socks' && break
+            sleep 1
+          done
+          docker logs smoke4
+          docker exec smoke4 pgrep -f breach-server >/dev/null
+          docker exec smoke4 pgrep -f 'sing-box run' >/dev/null
+          docker exec smoke4 test -s /etc/breach/qtun-pin
+          docker exec smoke4 provision-client mixed | tee /tmp/mblock
+          sed -n '/CONFIG-BEGIN/,/CONFIG-END/p' /tmp/mblock | sed '1d;$d' > /tmp/mblock.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/mblock.json'))
+          assert d["wireguard"] is None, d
+          assert d["hysteria2"] and d["socks5"], d
+          # One secret serves both: a client provisioned here may use either.
+          assert d["hysteria2"]["password"] == d["socks5"]["token"], d
+          print("hy2 + stream on one exit, sharing one client secret")
+          PY
+          docker rm -f smoke4
+
       - name: Smoke test (both protocols — exercises the WG tun path)
         env:
           REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}

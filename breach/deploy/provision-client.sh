@@ -38,20 +38,55 @@ if [ -f "$CONF_DIR/server.key" ]; then
   WG_JSON="{\"privateKey\":\"$CLIENT_PRIV\",\"peerPublicKey\":\"$SRV_PUB\",\"presharedKey\":\"$PSK\",\"address\":\"$ip4/32\"}"
 fi
 
-if [ -f "$CONF_DIR/cert.pem" ]; then
+# One secret serves both Hysteria2 and stream mode: each authenticates against
+# field 4 of the registry, so a client provisioned on an exit running both gets
+# a single password that works either way.
+SOCKS_JSON='null'
+if [ -f "$CONF_DIR/cert.pem" ] || [ -f "$CONF_DIR/qtun-pin" ]; then
   HY2_PW="$(openssl rand -base64 18 | tr -d '\n/+=')"
+fi
+# Stream mode authenticates on the same field, so the password must exist even
+# when Hysteria2 is off.
+if [ -z "$HY2_PW" ] && pgrep -f 'breach-server .*-socks ' >/dev/null 2>&1; then
+  HY2_PW="$(openssl rand -base64 18 | tr -d '\n/+=')"
+fi
+if [ -f "$CONF_DIR/cert.pem" ]; then
   HY2_JSON="{\"password\":\"$HY2_PW\",\"sni\":\"$HY2_SNI\",\"insecure\":true,\"alpn\":[\"h3\"]}"
+fi
+# The pin is what lets a client verify the exit; without it the client still
+# connects but cannot tell the exit from an impostor, and says so.
+#
+# Gated on stream mode being live NOW, not merely on the pin file: it survives in
+# the volume after PROTO stops including socks, and a client handed a socks5
+# block for an exit that no longer answers it just fails with no explanation.
+SOCKS_LIVE=0
+if [ -f "$CONF_DIR/qtun-pin" ] && pgrep -f 'breach-server .*-socks ' >/dev/null 2>&1; then
+  SOCKS_LIVE=1
+fi
+if [ "$SOCKS_LIVE" = 1 ]; then
+  SOCKS_JSON="{\"token\":\"$HY2_PW\",\"certSha256\":\"$(cat "$CONF_DIR/qtun-pin")\"}"
 fi
 
 # Append to the registry, then regenerate the live config from it.
 printf '%s\t%s\t%s\t%s\n' "$NAME" "$CLIENT_PUB" "$ip4" "$HY2_PW" >> "$CONF_DIR/clients"
 
 if [ -n "$CLIENT_PUB" ]; then
-  printf '%s\n' "$PSK" > /tmp/psk.$$; wg set wg0 peer "$CLIENT_PUB" preshared-key /tmp/psk.$$ allowed-ips "$ip4/32"; rm -f /tmp/psk.$$
+  # The registry can hold WireGuard state from an earlier PROTO while wg0 is not
+  # up (the operator narrowed PROTO to hy2,socks). Applying the peer is then
+  # impossible but not fatal: the config is still written, and the peer becomes
+  # live if WireGuard is switched back on. Without the guard `set -e` aborted the
+  # script here and no client block was ever printed.
+  printf '%s\n' "$PSK" > /tmp/psk.$$
+  if ip link show wg0 >/dev/null 2>&1; then
+    wg set wg0 peer "$CLIENT_PUB" preshared-key /tmp/psk.$$ allowed-ips "$ip4/32" || true
+  else
+    echo "note: wg0 is not up (PROTO has no wg); recorded the peer without applying it" >&2
+  fi
+  rm -f /tmp/psk.$$
   write_wg_conf
 fi
-if [ -n "$HY2_PW" ]; then write_hy2_users; reload_hy2; fi
+if [ -n "$HY2_PW" ] && [ -f "$CONF_DIR/cert.pem" ]; then write_hy2_users; reload_hy2; fi
 
 echo "===BREACH-CLIENT-CONFIG-BEGIN==="
-echo "{\"name\":\"$NAME\",\"server\":\"$PUBLIC_ENDPOINT\",\"wireguard\":$WG_JSON,\"hysteria2\":$HY2_JSON}"
+echo "{\"name\":\"$NAME\",\"server\":\"$PUBLIC_ENDPOINT\",\"wireguard\":$WG_JSON,\"hysteria2\":$HY2_JSON,\"socks5\":$SOCKS_JSON}"
 echo "===BREACH-CLIENT-CONFIG-END==="

@@ -235,6 +235,23 @@ is needed — egress is plain outbound.
   the dispatcher reads. For obfs, run a Hy2-only exit on its own port.
 - Adding a Hy2 user briefly bounces sing-box (auto-restarted by a wrapper); WG is
   a separate process and is untouched.
+- **`PROTO` is a list**, not one value: `PROTO=hy2,socks` runs both, `PROTO=all`
+  runs all three, and `both` still means `wg,hy2`. The relay picks a backend per
+  client from its first packet, so the mix costs nothing. WireGuard is the only
+  member that needs `NET_ADMIN` + `/dev/net/tun`; a list without `wg` runs
+  capless, and `install.sh` applies the capless compose overlay automatically.
+- `socks` is the **stream mode**: breach-server terminates the inner
+  protocol itself (QUIC, `breach/qtun`) and dials out, so the client serves a
+  local SOCKS5 proxy instead of running WireGuard or sing-box, and needs no tun
+  and no root. The exit runs a single binary with no caps and no extra port —
+  the QUIC listener sits on loopback behind the same relay port. add `socks` to the PROTO list to run
+  it alongside `wg`/`hy2` rather than instead of them; the relay dispatches per
+  client, so one exit can serve all three at once. `provision-client` then also
+  emits a `socks5` section carrying the client's token and the exit's
+  certificate pin.
+  Caveat worth knowing: SOCKS5 only carries the apps that speak it. UDP
+  (DNS, HTTP/3) works via UDP ASSOCIATE, but payloads over ~7 KB are dropped —
+  see `maxFragments` in breach/qtun.
 - Per-user **Hy2** traffic and online state come from sing-box's Clash API
   (loopback only, secret in `$CONF_DIR/clash-secret`), polled by `breach-mgmt`
   into `$CONF_DIR/hy2_stats`, which `stats` joins with the WireGuard numbers.

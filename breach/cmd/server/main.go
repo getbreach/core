@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"breach/media"
+	"breach/qtun"
 )
 
 const clientIDLen = 8
@@ -81,11 +82,14 @@ type peer struct {
 
 // clientGroup is one logical client: its allocations + a dedicated WG backend.
 type clientGroup struct {
-	id    string
-	wg    *net.UDPConn
-	mu    sync.Mutex
-	peers []*peer
-	rr    int
+	id string
+	wg *net.UDPConn
+	// stream marks the SOCKS5/QUIC backend, whose packets carry a leading marker
+	// byte that has to be stripped before the payload reaches it.
+	stream bool
+	mu     sync.Mutex
+	peers  []*peer
+	rr     int
 }
 
 func (g *clientGroup) add(p *peer) {
@@ -123,18 +127,29 @@ func (g *clientGroup) pruneLive(cut int64) int {
 }
 
 type srv struct {
-	conn    *net.UDPConn
-	wgAddr  *net.UDPAddr // backend for WireGuard clients (nil if disabled)
-	hy2Addr *net.UDPAddr // backend for Hysteria2/QUIC clients (nil if disabled)
-	mu      sync.Mutex
-	peers   map[string]*peer
-	groups  map[string]*clientGroup
+	conn      *net.UDPConn
+	wgAddr    *net.UDPAddr // backend for WireGuard clients (nil if disabled)
+	hy2Addr   *net.UDPAddr // backend for Hysteria2/QUIC clients (nil if disabled)
+	socksAddr *net.UDPAddr // backend for stream-mode (SOCKS5) clients (nil if disabled)
+	mu        sync.Mutex
+	peers     map[string]*peer
+	groups    map[string]*clientGroup
 }
 
 // pickBackend chooses a client's backend from the first byte of its first data
 // packet. QUIC (Hysteria2) always sets the header fixed bit (0x40); WireGuard
-// message types are 1..4 (bit clear). With only one backend configured, it wins.
+// message types are 1..4 (bit clear); stream mode announces itself with an
+// explicit marker, because ITS traffic is QUIC too and would otherwise be
+// indistinguishable from Hysteria2. The choice is made once per client and the
+// group remembers it, so the marker is sent only while a group is being set up.
+// With only one backend configured, it wins.
 func (s *srv) pickBackend(firstByte byte) *net.UDPAddr {
+	if firstByte == qtun.RelayMarker && s.socksAddr != nil {
+		return s.socksAddr
+	}
+	if s.wgAddr == nil && s.hy2Addr == nil {
+		return s.socksAddr // stream-only exit: nothing else to dispatch to
+	}
 	if s.hy2Addr == nil {
 		return s.wgAddr
 	}
@@ -160,7 +175,7 @@ func (s *srv) group(id string, backend *net.UDPAddr) *clientGroup {
 	}
 	wg.SetReadBuffer(8 << 20)
 	wg.SetWriteBuffer(8 << 20)
-	g := &clientGroup{id: id, wg: wg}
+	g := &clientGroup{id: id, wg: wg, stream: s.socksAddr != nil && backend.String() == s.socksAddr.String()}
 	s.groups[id] = g
 	go s.downstream(g)
 	log.Printf("new client %x (backend %s -> %s)", []byte(id), wg.LocalAddr(), backend)
@@ -205,6 +220,9 @@ func main() {
 	wg := flag.String("wg", "127.0.0.1:51820", "backend for WireGuard clients (empty to disable)")
 	hy2 := flag.String("hy2", "", "backend for Hysteria2/QUIC clients; if set, clients are dispatched wg|hy2 by sniffing the first packet")
 	kaMs := flag.Int("keepalive-ms", 50, "keepalive interval per relay stream (ms)")
+	socks := flag.String("socks", "", "loopback address for STREAM mode: the exit dials out itself, so a client can serve SOCKS5 without WireGuard/sing-box (empty to disable)")
+	clients := flag.String("clients", "/etc/breach/clients", "client registry used to authenticate stream-mode clients")
+	stateDir := flag.String("state-dir", "/etc/breach", "where the stream-mode TLS identity is kept")
 	flag.Parse()
 
 	laddr, err := net.ResolveUDPAddr("udp", *listen)
@@ -229,12 +247,18 @@ func main() {
 			log.Fatalf("resolve hy2: %v", err)
 		}
 	}
-	if wgAddr == nil && hy2Addr == nil {
-		log.Fatal("need at least one backend: -wg and/or -hy2")
+	var socksAddr *net.UDPAddr
+	if *socks != "" {
+		if socksAddr, err = startSocksBackend(*socks, *clients, *stateDir); err != nil {
+			log.Fatalf("stream mode: %v", err)
+		}
+	}
+	if wgAddr == nil && hy2Addr == nil && socksAddr == nil {
+		log.Fatal("need at least one backend: -wg, -hy2 and/or -socks")
 	}
 
-	s := &srv{conn: conn, wgAddr: wgAddr, hy2Addr: hy2Addr, peers: map[string]*peer{}, groups: map[string]*clientGroup{}}
-	log.Printf("breach-server: tunnel(dtls-srtp,multi-client)=%s wg=%q hy2=%q", *listen, *wg, *hy2)
+	s := &srv{conn: conn, wgAddr: wgAddr, hy2Addr: hy2Addr, socksAddr: socksAddr, peers: map[string]*peer{}, groups: map[string]*clientGroup{}}
+	log.Printf("breach-server: tunnel(dtls-srtp,multi-client)=%s wg=%q hy2=%q socks=%q", *listen, *wg, *hy2, *socks)
 
 	go func() {
 		for range time.Tick(time.Second) {
@@ -332,7 +356,21 @@ func main() {
 			}
 		}
 		if p.group != nil {
-			p.group.wg.Write(payload[clientIDLen:])
+			body := payload[clientIDLen:]
+			if p.group.stream {
+				// Every stream-mode packet is tagged, not just the first: the relay
+				// path drops packets, and a one-shot announcement that got lost
+				// would strand the client on the wrong backend. Tagging each packet
+				// costs a byte and removes the failure mode entirely.
+				if len(body) == 0 || body[0] != qtun.RelayMarker {
+					continue
+				}
+				body = body[1:]
+				if len(body) == 0 {
+					continue // bare tag, nothing to forward
+				}
+			}
+			p.group.wg.Write(body)
 			rxCount.Add(1)
 		}
 	}

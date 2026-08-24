@@ -17,8 +17,19 @@
 #          --sysctl net.ipv4.ip_forward=1)
 #   hy2 -> sing-box hysteria2 server
 #
+#   socks -> STREAM mode: breach-server dials out itself, so the client can serve
+#          a local SOCKS5 proxy. Needs NO sing-box, NO wireguard-go, NO caps and
+#          NO extra port -- it rides the same relay port on loopback.
+#
+# PROTO is a COMMA-SEPARATED LIST, because the relay dispatches per client and one
+# exit can serve any mix at once:
+#   PROTO=hy2            just Hysteria2
+#   PROTO=hy2,socks      Hysteria2 and stream mode
+#   PROTO=wg,hy2,socks   all three          (also spelled PROTO=all)
+#   PROTO=both           wg,hy2             (kept: it is what older .env files say)
+#
 # Env (only SEED a fresh state dir; ignored once state exists):
-#   PROTO both|wg|hy2 (default both)   LOG_LEVEL info|debug|trace
+#   PROTO <list> (default both)   LOG_LEVEL info|debug|trace
 #   RELAY_LISTEN :48000   KEEPALIVE_MS 50   PUBLIC_ENDPOINT <auto>:48000
 #   WG_SERVER_PRIVKEY  WG_PSK  WG_PEERS(seed pubkeys)  HY2_PASSWORD(seed)  HY2_SNI
 set -eu
@@ -33,13 +44,31 @@ HY2_PORT=51821
 # like the two above so it can never collide with an operator-set RELAY_PORT or
 # MGMT_PORT; breach-mgmt is told the same value below.
 CLASH_PORT=51822
+# Stream mode's QUIC listener, loopback only — never published.
+SOCKS_PORT=51823
 CONF_DIR="${CONF_DIR:-/etc/breach}"
 mkdir -p "$CONF_DIR"
-export CONF_DIR WG_PORT HY2_PORT CLASH_PORT LOG_LEVEL
+export CONF_DIR WG_PORT HY2_PORT CLASH_PORT SOCKS_PORT LOG_LEVEL
 . /usr/local/bin/breach-lib.sh
 
-case "$PROTO" in both) DO_WG=1; DO_HY2=1;; wg) DO_WG=1; DO_HY2=0;; hy2) DO_WG=0; DO_HY2=1;;
-  *) echo "unknown PROTO=$PROTO (want both|wg|hy2)" >&2; exit 1;; esac
+DO_WG=0; DO_HY2=0; DO_SOCKS=0
+PROTO="$(printf '%s' "$PROTO" | tr -d ' ')"
+OLDIFS="$IFS"; IFS=','
+for tok in $PROTO; do
+  case "$tok" in
+    wg)    DO_WG=1;;
+    hy2)   DO_HY2=1;;
+    socks) DO_SOCKS=1;;
+    both)  DO_WG=1; DO_HY2=1;;
+    all)   DO_WG=1; DO_HY2=1; DO_SOCKS=1;;
+    "")    ;;
+    *) IFS="$OLDIFS"; echo "unknown protocol '$tok' in PROTO=$PROTO (want wg, hy2, socks; both = wg,hy2; all = every one)" >&2; exit 1;;
+  esac
+done
+IFS="$OLDIFS"
+if [ "$DO_WG$DO_HY2$DO_SOCKS" = "000" ]; then
+  echo "PROTO=$PROTO selects no protocol" >&2; exit 1
+fi
 
 DEV="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"; [ -z "$DEV" ] && DEV=eth0
 
@@ -74,6 +103,10 @@ if [ "$DO_HY2" = 1 ] && [ ! -f "$CONF_DIR/cert.pem" ]; then
 fi
 
 PIDS=""
+SOCKS_FLAG=""
+if [ "$DO_SOCKS" = 1 ]; then
+  SOCKS_FLAG="-socks 127.0.0.1:$SOCKS_PORT -clients $CONF_DIR/clients -state-dir $CONF_DIR"
+fi
 # breach-server's -wg defaults to 127.0.0.1:51820, so NOT passing the flag leaves
 # a phantom WireGuard backend enabled on a hy2-only exit: the banner advertises
 # it and a non-QUIC first packet gets dispatched to a port nothing listens on.
@@ -143,7 +176,15 @@ if command -v breach-mgmt >/dev/null 2>&1 && [ "${MGMT_ENABLE:-1}" != 0 ]; then
 fi
 
 # shellcheck disable=SC2086
-breach-server -listen "$RELAY_LISTEN" $WG_FLAG $HY2_FLAG -keepalive-ms "$KEEPALIVE_MS" & MT=$!; PIDS="$PIDS $MT"
+breach-server -listen "$RELAY_LISTEN" $WG_FLAG $HY2_FLAG $SOCKS_FLAG -keepalive-ms "$KEEPALIVE_MS" & MT=$!; PIDS="$PIDS $MT"
+
+# provision-client publishes the stream-mode certificate pin, so wait for
+# breach-server to write it before anyone can provision (install.sh does so
+# seconds after boot).
+if [ "$DO_SOCKS" = 1 ]; then
+  i=0
+  while [ "$i" -lt 50 ] && [ ! -s "$CONF_DIR/qtun-pin" ]; do sleep 0.1; i=$((i+1)); done
+fi
 
 trap 'kill $PIDS 2>/dev/null || true' TERM INT
 while :; do
