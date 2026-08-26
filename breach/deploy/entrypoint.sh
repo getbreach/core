@@ -30,6 +30,9 @@
 #
 # Env (only SEED a fresh state dir; ignored once state exists):
 #   PROTO <list> (default both)   LOG_LEVEL info|debug|trace
+#   STRIPE  consecutive downstream packets per allocation before the round-robin
+#           advances (default 16; 1 = per-packet). Read on every start, not
+#           seeded, so it can be measured without touching the volume.
 #   RELAY_LISTEN :48000   KEEPALIVE_MS 50   PUBLIC_ENDPOINT <auto>:48000
 #   WG_SERVER_PRIVKEY  WG_PSK  WG_PEERS(seed pubkeys)  HY2_PASSWORD(seed)  HY2_SNI
 set -eu
@@ -176,7 +179,8 @@ if command -v breach-mgmt >/dev/null 2>&1 && [ "${MGMT_ENABLE:-1}" != 0 ]; then
 fi
 
 # shellcheck disable=SC2086
-breach-server -listen "$RELAY_LISTEN" $WG_FLAG $HY2_FLAG $SOCKS_FLAG -keepalive-ms "$KEEPALIVE_MS" & MT=$!; PIDS="$PIDS $MT"
+breach-server -listen "$RELAY_LISTEN" $WG_FLAG $HY2_FLAG $SOCKS_FLAG \
+  -keepalive-ms "$KEEPALIVE_MS" -stripe "${STRIPE:-16}" & MT=$!; PIDS="$PIDS $MT"
 
 # provision-client publishes the stream-mode certificate pin, so wait for
 # breach-server to write it before anyone can provision (install.sh does so

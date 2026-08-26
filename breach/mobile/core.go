@@ -94,6 +94,15 @@ type replenishResult struct {
 	quota  int
 }
 
+// stripeChunk keeps a burst of consecutive packets on one allocation before the
+// round-robin advances. Per-packet striping across relays of differing RTT
+// reorders the inner flow badly; WireGuard tolerates it (wide replay window) but
+// the inner TCP reads reordering as loss and collapses, and QUIC-based inner
+// protocols (Hysteria2) punish it harder still. A burst per relay keeps each
+// flow near-ordered while load stays spread; a full sweep of the pool stays
+// inside WireGuard's replay window.
+const stripeChunk = 16
+
 type pool struct {
 	mu      sync.RWMutex
 	streams []*stream
@@ -121,7 +130,7 @@ func (p *pool) pick() *stream {
 		return nil
 	}
 	i := atomic.AddUint64(&p.rr, 1)
-	return p.streams[int(i)%len(p.streams)]
+	return p.streams[int(i/stripeChunk)%len(p.streams)]
 }
 
 func (p *pool) add(s *stream) {

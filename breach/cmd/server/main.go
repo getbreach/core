@@ -80,6 +80,11 @@ type peer struct {
 	group *clientGroup // set once the clientID is learned
 }
 
+// stripeChunk is how many consecutive downstream packets ride one allocation
+// before the round-robin advances, mirroring the client's uplink striping.
+// Settable, so the downstream burst size can be measured against the client's.
+var stripeChunk = 16
+
 // clientGroup is one logical client: its allocations + a dedicated WG backend.
 type clientGroup struct {
 	id string
@@ -103,14 +108,20 @@ func (g *clientGroup) add(p *peer) {
 	g.peers = append(g.peers, p)
 }
 
+// pick spreads a client's downstream over its allocations in bursts, not
+// per-packet. See stripeChunk in the client: rotating on every packet reorders
+// the inner flow across relays of differing RTT and starves the inner TCP; the
+// download direction is where a speed test spends its bytes, so this is the
+// side that matters most. rr is a raw packet counter here; the modulo tracks a
+// changing peer set as allocations are added or pruned.
 func (g *clientGroup) pick() *peer {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if len(g.peers) == 0 {
 		return nil
 	}
-	g.rr = (g.rr + 1) % len(g.peers)
-	return g.peers[g.rr]
+	g.rr++
+	return g.peers[(g.rr/stripeChunk)%len(g.peers)]
 }
 
 func (g *clientGroup) pruneLive(cut int64) int {
@@ -223,7 +234,13 @@ func main() {
 	socks := flag.String("socks", "", "loopback address for STREAM mode: the exit dials out itself, so a client can serve SOCKS5 without WireGuard/sing-box (empty to disable)")
 	clients := flag.String("clients", "/etc/breach/clients", "client registry used to authenticate stream-mode clients")
 	stateDir := flag.String("state-dir", "/etc/breach", "where the stream-mode TLS identity is kept")
+	stripe := flag.Int("stripe", 16, "consecutive downstream packets per allocation before the round-robin advances (1 = per-packet)")
 	flag.Parse()
+
+	if *stripe < 1 {
+		log.Fatalf("-stripe must be >= 1 (got %d)", *stripe)
+	}
+	stripeChunk = *stripe
 
 	laddr, err := net.ResolveUDPAddr("udp", *listen)
 	if err != nil {

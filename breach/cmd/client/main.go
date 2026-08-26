@@ -35,6 +35,19 @@ type stream struct {
 
 func (s *stream) close() { s.a.Close() }
 
+// stripeChunk is how many consecutive packets ride one allocation before the
+// round-robin advances. Striping every single packet across relays with
+// different RTTs delivers the inner flow badly out of order: WireGuard accepts
+// the reordered transport packets (its replay window is wide) but hands them to
+// the tun out of sequence, so the inner TCP sees constant reordering, reads it
+// as loss, and collapses its window — the whole tunnel then crawls at a small
+// fraction of the relays' aggregate. Keeping a burst on one relay before
+// rotating holds each flow near-ordered while still spreading load; a full
+// sweep of the pool stays well inside WireGuard's replay window.
+// Settable so the value can be measured rather than assumed: the optimum depends
+// on how far apart the relays' RTTs are. -stripe 1 restores per-packet striping.
+var stripeChunk uint64 = 16
+
 type pool struct {
 	mu      sync.RWMutex
 	streams []*stream
@@ -62,7 +75,10 @@ func (p *pool) pick() *stream {
 		return nil
 	}
 	i := atomic.AddUint64(&p.rr, 1)
-	return p.streams[int(i)%len(p.streams)]
+	// Divide BEFORE narrowing: on a 32-bit int, converting the raw counter first
+	// wraps negative after a few tens of billions of packets and indexes out of
+	// range. Kept in uint64 the whole way.
+	return p.streams[(i/stripeChunk)%uint64(len(p.streams))]
 }
 
 // clientID tags every upstream packet so one server can demux multiple clients.
@@ -101,6 +117,7 @@ func main() {
 	socksPin := flag.String("socks-pin", "", "sha256 of the exit's stream-mode certificate, from its /etc/breach/qtun-pin")
 	socksUser := flag.String("socks-user", "", "optional username for the local SOCKS5 listener")
 	socksPass := flag.String("socks-pass", "", "optional password for the local SOCKS5 listener")
+	stripe := flag.Int("stripe", 16, "consecutive packets per allocation before the round-robin advances (1 = per-packet striping)")
 	flag.BoolVar(&maxproto.Verbose, "v", false, "verbose")
 	flag.Parse()
 
@@ -119,6 +136,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	rand.Read(clientID[:])
+
+	if *stripe < 1 {
+		log.Fatalf("-stripe must be >= 1 (got %d)", *stripe)
+	}
+	stripeChunk = uint64(*stripe)
 
 	if *turnTransport != "" {
 		cfg.TurnTransport = *turnTransport
