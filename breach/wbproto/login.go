@@ -114,7 +114,7 @@ func (f *LoginFlow) Complete(ctx context.Context, callbackURL, sessionPath strin
 	req.Header.Set("X-Device-Id", f.DeviceID)
 	req.AddCookie(&http.Cookie{Name: "device_id", Value: f.DeviceID})
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("exchange WBID code: %w", err)

@@ -19,6 +19,7 @@ import (
 
 	"breach/maxproto"
 	"breach/media"
+	"breach/provider"
 	"breach/turn"
 )
 
@@ -130,7 +131,9 @@ func (p *pool) pick() *stream {
 		return nil
 	}
 	i := atomic.AddUint64(&p.rr, 1)
-	return p.streams[int(i/stripeChunk)%len(p.streams)]
+	// Divide BEFORE narrowing: on a 32-bit int, converting the raw counter first
+	// wraps negative after tens of billions of packets and panics. Kept in uint64.
+	return p.streams[(i/stripeChunk)%uint64(len(p.streams))]
 }
 
 func (p *pool) add(s *stream) {
@@ -161,11 +164,14 @@ func (p *pool) length() int {
 
 // core is one running breach client instance.
 type core struct {
-	cfg      *maxproto.Config
-	peer     *net.UDPAddr
-	nStreams int
-	nMints   int
-	ka       time.Duration
+	cfg           *maxproto.Config  // MAX identity (nil in wb mode)
+	providerName  string            // "max" | "wb"
+	wbMinters     []provider.Minter // wb mode: one minter per WB session/chat
+	turnTransport string            // default client<->relay transport; creds.Transport wins
+	peer          *net.UDPAddr
+	nStreams      int
+	nMints        int
+	ka            time.Duration
 
 	clientID [8]byte
 	wgConn   *net.UDPConn
@@ -224,6 +230,35 @@ func newCore(cfg *maxproto.Config, peer *net.UDPAddr) *core {
 		c.nMints = 1
 	}
 	c.ka = clampKeepalive(cfg.KeepaliveMs)
+	c.providerName = "max"
+	c.turnTransport = cfg.TurnTransport
+	rand.Read(c.clientID[:])
+	c.lastErr.Store("")
+	c.logf = func(string) {}
+	return c
+}
+
+// newCoreWB builds a core that mints via a provider.Minter (WB) instead of MAX.
+// Tunnel params are explicit (there is no maxproto.Config); everything below
+// minting — pool, DTLS-SRTP, keepalive, replenish — is the shared MAX path.
+func newCoreWB(minters []provider.Minter, peer *net.UDPAddr, streams, mints, keepaliveMs int, transport string) *core {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &core{peer: peer, p: &pool{}, ctx: ctx, cancel: cancel, reconcile: make(chan struct{}, 1)}
+	c.providerName = "wb"
+	c.wbMinters = minters
+	c.nStreams = streams
+	if c.nStreams <= 0 {
+		c.nStreams = 4
+	}
+	c.nMints = mints
+	if c.nMints <= 0 {
+		c.nMints = 1
+	}
+	c.ka = clampKeepalive(keepaliveMs)
+	if transport == "" {
+		transport = "auto"
+	}
+	c.turnTransport = transport
 	rand.Read(c.clientID[:])
 	c.lastErr.Store("")
 	c.logf = func(string) {}
@@ -375,81 +410,108 @@ func (c *core) buildPool(freshMint bool) time.Time {
 	}
 
 	var allCreds []*maxproto.Creds
-	accounts := c.cfg.MintAccounts()
-	for ai, acfg := range accounts {
-		var cached []*maxproto.Creds
-		if !freshMint {
-			cached = maxproto.LoadCachedCreds(c.cfg.CredCacheDir, acfg.Token)
-		}
-		c.log("acct%d: %d valid cached creds (mints=%d streams=%d)", ai, len(cached), c.nMints, c.nStreams)
-		var usable []*maxproto.Creds
-		// Each mint creates its own group call by default so it gets its own MAX
-		// throttle bucket (throughput scales with mints). ReuseGroupCall instead
-		// re-joins one conference across this account's mints (seeded from a cached
-		// cred across restarts) — fewer calls, but a single shared bucket.
-		reuseLink := ""
-		if c.cfg.ReuseGroupCall {
-			for _, cc := range cached {
-				if cc != nil && cc.JoinLink != "" {
-					reuseLink = cc.JoinLink
-					break
+	if c.providerName == "wb" {
+		for mi, mtr := range c.wbMinters {
+			for m := 0; m < c.nMints; m++ {
+				select {
+				case <-c.ctx.Done():
+					return earliest
+				default:
 				}
-			}
-		}
-		for m := 0; m < c.nMints; m++ {
-			select {
-			case <-c.ctx.Done():
-				return earliest
-			default:
-			}
-			var creds *maxproto.Creds
-			fromCache := m < len(cached)
-			if fromCache {
-				creds = cached[m]
-			} else {
-				c.log("acct%d cred%d: minting (no cache)...", ai, m)
-				nc, err := maxproto.MintFrom(acfg, reuseLink)
+				c.log("wb minter%d cred%d: minting...", mi, m)
+				creds, err := mtr.Mint("")
 				if err != nil {
-					c.log("acct%d cred%d: mint FAILED: %v", ai, m, err)
-					c.setErr("mint acct%d failed: %v", ai, err)
-					break
+					c.log("wb minter%d cred%d: mint FAILED: %v", mi, m, err)
+					c.setErr("wb mint failed: %v", err)
+					continue
 				}
-				creds = nc
-				if c.cfg.ReuseGroupCall {
-					reuseLink = nc.JoinLink
+				result := openCred(creds)
+				c.log("wb minter%d cred%d: %d/%d allocations up", mi, m, result.opened, c.nStreams)
+				if result.opened > 0 {
+					allCreds = append(allCreds, creds)
+					if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
+						earliest = creds.ExpiresAt
+					}
 				}
 			}
-			result := openCred(creds)
-			src := "cache"
-			if !fromCache {
-				src = "mint"
+		}
+	} else {
+		accounts := c.cfg.MintAccounts()
+		for ai, acfg := range accounts {
+			var cached []*maxproto.Creds
+			if !freshMint {
+				cached = maxproto.LoadCachedCreds(c.cfg.CredCacheDir, acfg.Token)
 			}
-			c.log("acct%d cred%d (%s): %d/%d allocations up", ai, m, src, result.opened, c.nStreams)
-			if result.opened == 0 && result.quota > 0 && fromCache {
-				// Force a FRESH conference here: re-joining the old link returns the
-				// SAME (exhausted) credential, so a refresh needs a new conference.
-				c.log("acct%d cred%d: cached cred quota exhausted, re-minting (new conference)...", ai, m)
-				if nc, err := maxproto.MintFrom(acfg, ""); err == nil {
+			c.log("acct%d: %d valid cached creds (mints=%d streams=%d)", ai, len(cached), c.nMints, c.nStreams)
+			var usable []*maxproto.Creds
+			// Each mint creates its own group call by default so it gets its own MAX
+			// throttle bucket (throughput scales with mints). ReuseGroupCall instead
+			// re-joins one conference across this account's mints (seeded from a cached
+			// cred across restarts) — fewer calls, but a single shared bucket.
+			reuseLink := ""
+			if c.cfg.ReuseGroupCall {
+				for _, cc := range cached {
+					if cc != nil && cc.JoinLink != "" {
+						reuseLink = cc.JoinLink
+						break
+					}
+				}
+			}
+			for m := 0; m < c.nMints; m++ {
+				select {
+				case <-c.ctx.Done():
+					return earliest
+				default:
+				}
+				var creds *maxproto.Creds
+				fromCache := m < len(cached)
+				if fromCache {
+					creds = cached[m]
+				} else {
+					c.log("acct%d cred%d: minting (no cache)...", ai, m)
+					nc, err := maxproto.MintFrom(acfg, reuseLink)
+					if err != nil {
+						c.log("acct%d cred%d: mint FAILED: %v", ai, m, err)
+						c.setErr("mint acct%d failed: %v", ai, err)
+						break
+					}
 					creds = nc
 					if c.cfg.ReuseGroupCall {
 						reuseLink = nc.JoinLink
 					}
-					result = openCred(creds)
-					c.log("acct%d cred%d (remint): %d/%d allocations up", ai, m, result.opened, c.nStreams)
-				} else {
-					c.log("acct%d cred%d: re-mint FAILED: %v", ai, m, err)
-					c.setErr("re-mint acct%d failed: %v", ai, err)
+				}
+				result := openCred(creds)
+				src := "cache"
+				if !fromCache {
+					src = "mint"
+				}
+				c.log("acct%d cred%d (%s): %d/%d allocations up", ai, m, src, result.opened, c.nStreams)
+				if result.opened == 0 && result.quota > 0 && fromCache {
+					// Force a FRESH conference here: re-joining the old link returns the
+					// SAME (exhausted) credential, so a refresh needs a new conference.
+					c.log("acct%d cred%d: cached cred quota exhausted, re-minting (new conference)...", ai, m)
+					if nc, err := maxproto.MintFrom(acfg, ""); err == nil {
+						creds = nc
+						if c.cfg.ReuseGroupCall {
+							reuseLink = nc.JoinLink
+						}
+						result = openCred(creds)
+						c.log("acct%d cred%d (remint): %d/%d allocations up", ai, m, result.opened, c.nStreams)
+					} else {
+						c.log("acct%d cred%d: re-mint FAILED: %v", ai, m, err)
+						c.setErr("re-mint acct%d failed: %v", ai, err)
+					}
+				}
+				if result.quota < c.nStreams || result.opened > 0 {
+					usable = append(usable, creds)
+					if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
+						earliest = creds.ExpiresAt
+					}
 				}
 			}
-			if result.quota < c.nStreams || result.opened > 0 {
-				usable = append(usable, creds)
-				if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
-					earliest = creds.ExpiresAt
-				}
-			}
+			maxproto.SaveCachedCreds(c.cfg.CredCacheDir, acfg.Token, usable)
+			allCreds = append(allCreds, usable...)
 		}
-		maxproto.SaveCachedCreds(c.cfg.CredCacheDir, acfg.Token, usable)
-		allCreds = append(allCreds, usable...)
 	}
 
 	if c.ctx.Err() != nil {
@@ -490,7 +552,11 @@ func (c *core) openOne(creds *maxproto.Creds, i int) (*stream, error) {
 		return nil, fmt.Errorf("credential has no TURN hosts")
 	}
 	host := hosts[i%len(hosts)]
-	a, err := turn.NewAlloc(host, creds.Username, creds.Credential, c.peer, 0x4000, c.cfg.TurnTransport)
+	tr := creds.Transport
+	if tr == "" {
+		tr = c.turnTransport
+	}
+	a, err := turn.NewAlloc(host, creds.Username, creds.Credential, c.peer, 0x4000, tr)
 	if err != nil {
 		c.setErr("alloc (%s): %v", host, err)
 		return nil, err

@@ -20,7 +20,9 @@ import (
 	"time"
 
 	"breach/maxproto"
+	"breach/provider"
 	"breach/turn"
+	"breach/wbproto"
 )
 
 // activeCore points at the one running core so the app can poll the LIVE
@@ -90,11 +92,26 @@ func StartTransport(configJSON string, p Protector, l Logger) (*Tunnel, error) {
 		}
 	}
 
+	var probe struct {
+		Provider string `json:"provider"`
+	}
+	_ = json.Unmarshal([]byte(configJSON), &probe)
+	switch probe.Provider {
+	case "", "max":
+		return startMAX(configJSON, p, logf, l)
+	case "wb":
+		return startWB(configJSON, p, logf, l)
+	default:
+		return nil, fmt.Errorf("config: unknown provider %q (want max|wb)", probe.Provider)
+	}
+}
+
+// startMAX is the original MAX-TURN transport path.
+func startMAX(configJSON string, p Protector, logf func(string), l Logger) (*Tunnel, error) {
 	mc, err := maxproto.ParseConfig([]byte(configJSON))
 	if err != nil {
 		return nil, err
 	}
-
 	server := mc.Server
 	if server == "" {
 		return nil, fmt.Errorf("config: \"server\" (exit ip:port) is required")
@@ -107,18 +124,68 @@ func StartTransport(configJSON string, p Protector, l Logger) (*Tunnel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve server %s: %w", server, err)
 	}
+	logf(fmt.Sprintf("transport starting: provider=max server=%s mouth=%s streams=%d mints=%d mintMode=%s",
+		server, wgListen, mc.Streams, mc.Mints, mc.MintMode))
+	co := newCore(mc, peer)
+	return launch(co, wgListen, mc.DNS, p, logf, l)
+}
 
-	// Install the socket-protection hooks, read by turn.NewAlloc and
-	// maxproto.Dial. Serialized: one transport runs at a time.
+// startWB mints through WB Chat instead of MAX. The WB session lives at a path in
+// the app's private storage ("wbSession"); wbproto's token refresh persists there.
+// Minting itself happens inside co.start (buildPool), after launch has installed
+// the socket-protect + DNS hooks, so the WB API calls bypass the tun.
+func startWB(configJSON string, p Protector, logf func(string), l Logger) (*Tunnel, error) {
+	var wc struct {
+		Server      string `json:"server"`
+		WGListen    string `json:"wgListen"`
+		Streams     int    `json:"streams"`
+		Mints       int    `json:"mints"`
+		KeepaliveMs int    `json:"keepaliveMs"`
+		DNS         string `json:"dns"`
+		Transport   string `json:"turnTransport"`
+		WBSession   string `json:"wbSession"`
+		WBChat      string `json:"wbChat"`
+		WBCallee    string `json:"wbCallee"`
+		WBCallType  string `json:"wbCallType"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &wc); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if wc.Server == "" {
+		return nil, fmt.Errorf("config: \"server\" (exit ip:port) is required")
+	}
+	wgListen := wc.WGListen
+	if wgListen == "" {
+		wgListen = "127.0.0.1:51821"
+	}
+	peer, err := net.ResolveUDPAddr("udp", wc.Server)
+	if err != nil {
+		return nil, fmt.Errorf("resolve server %s: %w", wc.Server, err)
+	}
+	m, err := wbproto.NewMinter(wc.WBSession, wc.WBChat, wc.WBCallee, wc.WBCallType, wc.Transport)
+	if err != nil {
+		return nil, fmt.Errorf("wb: %w", err)
+	}
+	logf(fmt.Sprintf("transport starting: provider=wb server=%s mouth=%s streams=%d mints=%d chat=%s",
+		wc.Server, wgListen, wc.Streams, wc.Mints, wc.WBChat))
+	co := newCoreWB([]provider.Minter{m}, peer, wc.Streams, wc.Mints, wc.KeepaliveMs, wc.Transport)
+	return launch(co, wgListen, wc.DNS, p, logf, l)
+}
+
+// launch installs the socket-protect + DNS hooks, starts the core (blocks until
+// the first pool build), and returns the Tunnel handle. Shared by both providers.
+func launch(co *core, wgListen, dns string, p Protector, logf func(string), l Logger) (*Tunnel, error) {
+	// Install the socket-protection hooks, read by turn.NewAlloc, maxproto.Dial and
+	// wbproto's HTTP. Serialized: one transport runs at a time.
 	protectMu.Lock()
 	ctrl := protectControl(p, logf)
 	turn.Control = ctrl
 	maxproto.Control = ctrl
+	wbproto.Control = ctrl
 	protectMu.Unlock()
 
-	// Android has no /etc/resolv.conf; resolve the MAX API host via an explicit DNS
-	// over a protected socket so the query bypasses the tun.
-	dns := mc.DNS
+	// Android has no /etc/resolv.conf; resolve API hosts via an explicit DNS over a
+	// protected socket so the query bypasses the tun.
 	if dns == "" {
 		dns = "77.88.8.8:53"
 	}
@@ -130,10 +197,6 @@ func StartTransport(configJSON string, p Protector, l Logger) (*Tunnel, error) {
 		},
 	}
 
-	logf(fmt.Sprintf("transport starting: server=%s mouth=%s streams=%d mints=%d mintMode=%s",
-		server, wgListen, mc.Streams, mc.Mints, mc.MintMode))
-
-	co := newCore(mc, peer)
 	co.logf = logf
 	activeCore.Store(co) // expose live count during the blocking buildPool
 	if err := co.start(wgListen); err != nil {
@@ -142,7 +205,6 @@ func StartTransport(configJSON string, p Protector, l Logger) (*Tunnel, error) {
 		return nil, fmt.Errorf("transport start: %w", err)
 	}
 	logf(fmt.Sprintf("transport running: mouth=%s", wgListen))
-
 	now := time.Now()
 	return &Tunnel{core: co, log: l, startedAt: now, lastWhen: now}, nil
 }

@@ -9,14 +9,43 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// Control, when non-nil, is installed on every WB HTTP/DNS socket the package
+// opens (Android VpnService.protect), so WB API traffic bypasses the tun instead
+// of looping into it. nil = no-op (the CLI needs none).
+var Control func(network, address string, c syscall.RawConn) error
+
+func dialControl(network, address string, c syscall.RawConn) error {
+	if Control != nil {
+		return Control(network, address, c)
+	}
+	return nil
+}
+
+// newHTTPClient builds the one HTTP client every WB call uses, wiring the
+// socket-protect hook so it is honoured for the TCP connect too (not only DNS).
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyFromEnvironment,
+			DialContext:       (&net.Dialer{Timeout: 8 * time.Second, Control: dialControl}).DialContext,
+			ForceAttemptHTTP2: true,
+			MaxIdleConns:      20,
+			IdleConnTimeout:   90 * time.Second,
+		},
+	}
+}
 
 const (
 	chatBaseURL = "https://chat.wb.ru"
@@ -141,7 +170,7 @@ func Load(sessionPath string) (*Client, error) {
 		s.RedirectURI = "https://chat.wb.ru/android/ru.wb.workspace/callback"
 	}
 	return &Client{
-		HTTP:        &http.Client{Timeout: 30 * time.Second},
+		HTTP:        newHTTPClient(30 * time.Second),
 		Session:     s,
 		SessionPath: sessionPath,
 	}, nil
@@ -456,4 +485,18 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// ChatViews lists the account's chats (raw JSON: {"chatViews":[...],"nextPageToken":...}),
+// so a client UI can let the user pick which personal chat to mint from.
+func (c *Client) ChatViews(ctx context.Context, pageSize int) (json.RawMessage, error) {
+	if pageSize <= 0 {
+		pageSize = 200
+	}
+	var raw json.RawMessage
+	ep := chatBaseURL + "/api/messenger/v2/chatViews:liteList?pageSize=" + strconv.Itoa(pageSize)
+	if err := c.do(ctx, http.MethodGet, ep, nil, &raw, true); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
