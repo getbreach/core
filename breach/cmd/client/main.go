@@ -23,7 +23,9 @@ import (
 
 	"breach/maxproto"
 	"breach/media"
+	"breach/provider"
 	"breach/turn"
+	"breach/wbproto"
 )
 
 // stream = one TURN allocation running a DTLS-SRTP session (each allocation is a
@@ -118,6 +120,12 @@ func main() {
 	socksUser := flag.String("socks-user", "", "optional username for the local SOCKS5 listener")
 	socksPass := flag.String("socks-pass", "", "optional password for the local SOCKS5 listener")
 	stripe := flag.Int("stripe", 16, "consecutive packets per allocation before the round-robin advances (1 = per-packet striping)")
+	providerName := flag.String("provider", "max", "TURN provider: max|wb")
+	wbSession := flag.String("wb-session", "", "provider=wb: WBID session file")
+	wbChat := flag.String("wb-chat", "", "provider=wb: personal chat 'chats/<id>' to resolve the peer from")
+	wbCallee := flag.String("wb-callee", "", "provider=wb: peer userID to call (alternative to -wb-chat)")
+	wbCallType := flag.String("wb-calltype", "AUDIO", "provider=wb: call type AUDIO|VIDEO")
+	wbLogin := flag.Bool("wb-login", false, "provider=wb: authenticate via WB ID (prints a link, reads the callback URL) and save the session to -wb-session")
 	flag.BoolVar(&maxproto.Verbose, "v", false, "verbose")
 	flag.Parse()
 
@@ -131,10 +139,16 @@ func main() {
 		return
 	}
 
-	cfg, err := loadClientConfig(*cfgPath, *sessionPath)
-	if err != nil {
-		log.Fatalf("config: %v", err)
+	// WB ID browser-callback login (provider=wb): also runs before any config is
+	// loaded — its whole point is producing a session for someone who has none.
+	if *wbLogin {
+		setResolver(*dnsFlag)
+		if err := runWBLogin(*wbSession); err != nil {
+			log.Fatalf("wb-login: %v", err)
+		}
+		return
 	}
+
 	rand.Read(clientID[:])
 
 	if *stripe < 1 {
@@ -142,33 +156,50 @@ func main() {
 	}
 	stripeChunk = uint64(*stripe)
 
-	if *turnTransport != "" {
-		cfg.TurnTransport = *turnTransport
-	}
+	// Tunnel settings default to the flags. The MAX config may override them (so
+	// an Android/no-args run works from config alone); WB takes them from flags.
+	srv, wgl := *server, *wgListen
+	nStreams, nMints := *streams, *mints
 
-	dns := *dnsFlag
-	if dns == "" {
-		dns = cfg.DNS
-	}
-	setResolver(dns)
-
-	// Config values win when set, so the binary works with NO CLI args (required
-	// on Android, where a standalone GOOS=android binary doesn't receive os.Args).
-	srv := *server
-	if cfg.Server != "" {
-		srv = cfg.Server
-	}
-	wgl := *wgListen
-	if cfg.WGListen != "" {
-		wgl = cfg.WGListen
-	}
-	nStreams := *streams
-	if cfg.Streams > 0 {
-		nStreams = cfg.Streams
-	}
-	nMints := *mints
-	if cfg.Mints > 0 {
-		nMints = cfg.Mints
+	// The provider decides only WHERE the TURN creds come from; everything below
+	// buildPool (allocations, DTLS-SRTP, the pool) is identical for MAX and WB.
+	var minters []provider.Minter
+	switch *providerName {
+	case "", "max":
+		cfg, err := loadClientConfig(*cfgPath, *sessionPath)
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		if *turnTransport != "" {
+			cfg.TurnTransport = *turnTransport
+		}
+		dns := *dnsFlag
+		if dns == "" {
+			dns = cfg.DNS
+		}
+		setResolver(dns)
+		if cfg.Server != "" {
+			srv = cfg.Server
+		}
+		if cfg.WGListen != "" {
+			wgl = cfg.WGListen
+		}
+		if cfg.Streams > 0 {
+			nStreams = cfg.Streams
+		}
+		if cfg.Mints > 0 {
+			nMints = cfg.Mints
+		}
+		minters = cfg.Minters()
+	case "wb":
+		setResolver(*dnsFlag)
+		m, err := wbproto.NewMinter(*wbSession, *wbChat, *wbCallee, *wbCallType, *turnTransport)
+		if err != nil {
+			log.Fatalf("wb: %v", err)
+		}
+		minters = []provider.Minter{m}
+	default:
+		log.Fatalf("unknown -provider %q (want max|wb)", *providerName)
 	}
 
 	if srv == "" {
@@ -198,13 +229,13 @@ func main() {
 
 	kaInterval := time.Duration(*kaMs) * time.Millisecond
 	p := &pool{}
-	expiry := buildPool(p, cfg, peer, nMints, nStreams, *turnOverride, kaInterval)
+	expiry := buildPool(p, minters, peer, nMints, nStreams, *turnOverride, kaInterval)
 	if len(p.snapshot()) == 0 {
 		log.Fatal("no allocations established")
 	}
 
 	go turnKeepaliveLoop(p)
-	go remintLoop(p, cfg, peer, nMints, nStreams, *turnOverride, kaInterval, expiry)
+	go remintLoop(p, minters, peer, nMints, nStreams, *turnOverride, kaInterval, expiry)
 	go func() {
 		for range time.Tick(time.Second) {
 			log.Printf("[stat] upstream=%d turnSends=%d downAll=%d downRTP=%d decFail=%d downData=%d",
@@ -242,25 +273,26 @@ func main() {
 	}
 }
 
-func buildPool(p *pool, cfg *maxproto.Config, peer *net.UDPAddr, mints, streams int, turnOverride string, ka time.Duration) time.Time {
+func buildPool(p *pool, minters []provider.Minter, peer *net.UDPAddr, mints, streams int, turnOverride string, ka time.Duration) time.Time {
 	var out []*stream
 	earliest := time.Time{}
 
-	// One config per MAX account (just the base config when there is no
-	// accounts[] list). Spreading mints across accounts is how throughput scales
-	// past the per-account relay cap — each account has its own callsUserId.
-	for ai, acfg := range cfg.MintAccounts() {
-		// Each mint creates its OWN group call by default so it gets its own MAX
-		// throttle bucket (throughput scales with mints). ReuseGroupCall re-joins
-		// one conference instead — fewer calls in history, but one shared bucket.
+	// One Minter per account (just the base identity when there is no accounts[]
+	// list). Spreading mints across accounts is how throughput scales past the
+	// per-account relay cap — each account has its own throttle bucket.
+	for ai, mtr := range minters {
+		// Each mint creates its OWN group call by default so it gets its own
+		// throttle bucket (throughput scales with mints). A provider that reuses a
+		// conference (MAX ReuseGroupCall) instead threads the link back — fewer
+		// calls in history, but one shared bucket.
 		reuseLink := ""
 		for m := 0; m < mints; m++ {
-			creds, err := maxproto.MintFrom(acfg, reuseLink)
+			creds, err := mtr.Mint(reuseLink)
 			if err != nil {
 				log.Printf("acct%d mint %d failed: %v", ai, m, err)
 				continue
 			}
-			if acfg.ReuseGroupCall {
+			if mtr.Reuses() {
 				reuseLink = creds.JoinLink
 			}
 			if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
@@ -273,7 +305,7 @@ func buildPool(p *pool, cfg *maxproto.Config, peer *net.UDPAddr, mints, streams 
 			ok := 0
 			for i := 0; i < streams; i++ {
 				host := hosts[i%len(hosts)]
-				a, err := turn.NewAlloc(host, creds.Username, creds.Credential, peer, 0x4000, acfg.TurnTransport)
+				a, err := turn.NewAlloc(host, creds.Username, creds.Credential, peer, 0x4000, creds.Transport)
 				if err != nil {
 					log.Printf("acct%d mint %d alloc %d (%s): %v", ai, m, i, host, err)
 					continue
@@ -370,7 +402,7 @@ func turnKeepaliveLoop(p *pool) {
 	}
 }
 
-func remintLoop(p *pool, cfg *maxproto.Config, peer *net.UDPAddr, mints, streams int, turnOverride string, ka time.Duration, expiry time.Time) {
+func remintLoop(p *pool, minters []provider.Minter, peer *net.UDPAddr, mints, streams int, turnOverride string, ka time.Duration, expiry time.Time) {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for range t.C {
@@ -378,7 +410,7 @@ func remintLoop(p *pool, cfg *maxproto.Config, peer *net.UDPAddr, mints, streams
 			continue
 		}
 		log.Printf("re-minting (creds expire %s)...", expiry.Format(time.RFC3339))
-		expiry = buildPool(p, cfg, peer, mints, streams, turnOverride, ka)
+		expiry = buildPool(p, minters, peer, mints, streams, turnOverride, ka)
 		log.Printf("re-mint done: %d allocations", len(p.snapshot()))
 	}
 }

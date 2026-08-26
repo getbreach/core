@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"breach/provider"
 )
 
 type UserAgent struct {
@@ -213,21 +215,10 @@ func ParseConfig(data []byte) (*Config, error) {
 	return &c, nil
 }
 
-// Creds is a single minted TURN credential set.
-type Creds struct {
-	TurnHosts    []string // host:port list
-	Username     string
-	Credential   string
-	StunHosts    []string
-	ExpiresAt    time.Time
-	CallsUserID  int64
-	Conversation string
-
-	// JoinLink is the group-call link this credential was minted from. Reusing
-	// it on the next mint re-joins the SAME conference for fresh creds instead of
-	// creating a new one. Persisted with the cred cache, so it survives restarts.
-	JoinLink string `json:"joinLink,omitempty"`
-}
+// Creds is a single minted TURN credential set. It is an alias for the shared
+// provider.Creds so MAX and any other messenger hand the tunnel the exact same
+// type; the on-disk cred cache (credcache.go) round-trips unchanged.
+type Creds = provider.Creds
 
 // Mint logs in and starts a 1:1 call (opcode 78) to harvest fresh TURN creds.
 func Mint(cfg *Config) (*Creds, error) {
