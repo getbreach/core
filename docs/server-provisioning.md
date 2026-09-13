@@ -1,35 +1,31 @@
-# In-app server provisioning & management
+# Деплой и управление сервером из приложения
 
-Deploy a Breach exit onto a bare VPS **from the app** (one SSH pass), then manage
-it **without keeping SSH credentials** — through a small pinned-TLS admin API on
-the exit. This is the Outline-manager model: SSH once to install, a scoped secret
-forever after.
+Поднять exit Breach на голом VPS **из приложения** (один заход по SSH), а дальше
+управлять им **без хранения SSH-реквизитов** — через маленький admin-API на
+exit'е с pinned-TLS. Модель Outline-менеджера: SSH один раз для установки, потом
+навсегда — только ограниченный секрет.
 
 ```
-┌ app ┐   SSH (once)         ┌ fresh VPS ┐
-│      │ ───────────────────►│ install.sh│  Docker + breach-exit + breach-mgmt
-│      │ ◄─── handle ────────│           │  {url, secret, certSha256}
-│      │                     └───────────┘
-│      │   HTTPS (pinned) — add/list/remove/stats/routes, no SSH
+┌ app ┐   SSH (однократно)   ┌ чистый VPS ┐
+│      │ ───────────────────►│ install.sh │  Docker + breach-exit + breach-mgmt
+│      │ ◄─── handle ─────────│            │  {url, secret, certSha256}
+│      │   HTTPS (pinned) — add/list/remove/stats/routes, без SSH
 │      │ ───────────────────► breach-mgmt (tcp/48000)
 └──────┘
 ```
 
-Two artifacts come back from provisioning and are stored separately:
+Из провижининга возвращаются два артефакта, хранятся раздельно:
 
-| Artifact | What it is | Produced by |
+| Артефакт | Что это | Кто выдаёт |
 |---|---|---|
-| **server handle** | `{url, host, port, secret, certSha256}` — manages the exit | `breach-mgmt` (printed at first boot) |
-| **provision block** | `{name, server, wireguard, hysteria2}` — one client's exit config | `provision-client` |
+| **handle сервера** | `{url, host, port, secret, certSha256}` — управляет exit'ом | `breach-mgmt` (печатает при первом старте) |
+| **provision-блок** | `{name, server, wireguard, hysteria2}` — конфиг одного клиента | `provision-client` |
 
-Neither is a `StartTransport` config on its own. The tunnel config is the app’s
-merge of a **MAX identity** (from `LoginByPhone`) + a **provision block** (from a
-server) — the same `ConfigImport.fromProvisionBlock` + `CoreConfigBuilder` path
-you already use for a manually-imported block.
+Ни один сам по себе не является конфигом `StartTransport`. Конфиг туннеля —
+слияние **идентичности мессенджера** (из логина) и **provision-блока** (с
+сервера).
 
----
-
-## 1. One-tap install: `ProvisionServer`
+## 1. Установка в один тап: `ProvisionServer`
 
 ```go
 func ProvisionServer(optionsJSON string, p Protector, progress ProvisionProgress) (*ProvisionResult, error)
@@ -39,129 +35,80 @@ func ProvisionServer(optionsJSON string, p Protector, progress ProvisionProgress
 
 ```json
 {
-  "host": "1.2.3.4",
-  "port": 22,
-  "user": "root",
-  "password": "…",           // OR "privateKey": "-----BEGIN …", "passphrase": "…"
-  "proto": "hy2",            // hy2 (default, no tun/caps needed) | both | wg
+  "host": "1.2.3.4", "port": 22, "user": "root",
+  "password": "…",              // ЛИБО "privateKey": "-----BEGIN …", "passphrase": "…"
+  "proto": "hy2",               // hy2 (по умолч., без tun/caps) | both | wg | socks
   "relayPort": 48000,
   "clientName": "phoneA",
-  "mgmtEnable": true,        // default true
-  "hostKeyFingerprint": ""   // empty = trust-on-first-use; set to require a match
+  "mgmtEnable": true,
+  "hostKeyFingerprint": ""      // пусто = trust-on-first-use; задать = требовать совпадения
 }
 ```
 
-`ProvisionResult` (all strings, gomobile-safe):
+`ProvisionResult` (все строки, gomobile-safe):
 
-- `ServerConfigJSON` — the provision block → feed to `ConfigImport.fromProvisionBlock`.
-- `HandleJSON` — the **server handle** → persist it (Android Keystore); this is
-  what all later management calls take. Empty if `mgmtEnable=false`.
-- `HostKeyFingerprint` — `SHA256:…` of the box’s SSH host key. Store it and pass
-  it back as `hostKeyFingerprint` on any later SSH to that box (pin-on-repeat).
+- `ServerConfigJSON` — provision-блок.
+- `HandleJSON` — **handle сервера**; сохрани его (Android Keystore) — по нему идут
+  все дальнейшие вызовы управления. Пусто при `mgmtEnable=false`.
+- `HostKeyFingerprint` — `SHA256:…` SSH-хост-ключа; сохрани и передавай обратно
+  как `hostKeyFingerprint` при повторных SSH (пиннинг).
 
-Kotlin:
+**После этого SSH-пароль/ключ можно выбросить** — больше не нужен.
 
-```kotlin
-val opts = JSONObject()
-  .put("host", host).put("password", pass)
-  .put("proto", "hy2").put("clientName", "phoneA")
-  .toString()
+## 2. Управление без SSH (handle-API)
 
-val res = Breachmobile.provisionServer(opts, /* Protector or */ null,
-  object : ProvisionProgress { override fun line(s: String) = appendLog(s) })
-
-saveServerHandle(res.handleJSON)                 // manage without SSH from now on
-val server = ConfigImport.fromProvisionBlock(res.serverConfigJSON)
-// then: CoreConfigBuilder.build(server, maxAccount, …) → BumpClientSession → startTransport
-```
-
-**After this, discard the SSH password/key** — it is never needed again.
-
----
-
-## 2. Manage without SSH (the handle API)
-
-All take the handle JSON and an optional `Protector` (pass one only if a tun is
-up so the socket bypasses it; else `null`). They fail closed on a TLS-pin
-mismatch and never surface the secret in an error.
+Все берут handle JSON и опциональный `Protector` (передавай, только если tun
+поднят — чтобы сокет шёл мимо него; иначе `null`). Fail-closed при несовпадении
+TLS-пина, секрет в ошибках не светится.
 
 ```go
-ServerCheck(handleJSON string, p Protector) (string, error)               // health / validate handle
-ServerAddClient(handleJSON, name string, p Protector) (string, error)     // → a new provision block
-ServerListClients(handleJSON string, p Protector) (string, error)         // [{name,address,wg,hy2}]
-ServerRemoveClient(handleJSON, name string, p Protector) error
-ServerStats(handleJSON string, p Protector) (string, error)               // {server:{…}, clients:[…]}
-ServerSetRoutes(handleJSON, routeJSON string, p Protector) error          // "" clears the policy
+ServerCheck(handleJSON, p) (string, error)              // здоровье / валидация handle
+ServerAddClient(handleJSON, name, p) (string, error)    // → новый provision-блок
+ServerListClients(handleJSON, p) (string, error)        // [{name,address,wg,hy2}]
+ServerRemoveClient(handleJSON, name, p) error
+ServerStats(handleJSON, p) (string, error)              // {server:{…}, clients:[…]}
+ServerSetRoutes(handleJSON, routeJSON, p) error         // "" сбрасывает политику
 ```
 
-```kotlin
-val block = Breachmobile.serverAddClient(handleJSON, "tablet", null)  // add a device
-val server = ConfigImport.fromProvisionBlock(block)                   // → a profile
-Breachmobile.serverRemoveClient(handleJSON, "tablet", null)           // revoke
-```
+Имя клиента: `1–32` из `A–Z a–z 0–9 _ -` (проверяется и в приложении, и на сервере).
 
-Client `name`: `1–32` of `A–Z a–z 0–9 _ -` (enforced app- and server-side).
+## 3. Сервер: `breach-mgmt`
 
-> **The old JSch `SshAdmin` is gone.** The Android client deleted it (and the JSch
-> dependency) in favour of `ProvisionServer` for setup plus the handle API for
-> everything after; see `android/app/src/main/java/pw/komet/breach/data/ServerAdmin.kt`.
-> Servers added before the handle existed have none, and are shown as
-> "management unavailable — deploy again" rather than silently failing.
+HTTPS-сервис с фиксированным набором глаголов внутри exit-контейнера, обёртка над
+теми же `provision-client`/`list-clients`/`remove-client`/`stats`/`set-routes`.
+**Не** remote shell — утёкший секрет может только добавить/убрать VPN-юзера,
+прочитать статистику или задать egress-политику, но не выполнить произвольную
+команду и не получить root.
 
----
-
-## 3. The server side: `breach-mgmt`
-
-A fixed-verb HTTPS service inside the exit container that wraps the same
-`provision-client`/`list-clients`/`remove-client`/`stats`/`set-routes` tools.
-**Not** a remote shell — a leaked secret can only add/remove a VPN user, read
-stats or set the egress policy, never run an arbitrary command or gain root.
-
-Verbs: `GET /health`, `GET|POST /clients`, `DELETE /clients/<name>`,
+Глаголы: `GET /health`, `GET|POST /clients`, `DELETE /clients/<name>`,
 `GET /stats`, `PUT /routes`.
 
-`PUT /routes` takes `{"route": <sing-box "route" object>}` or `{"clear": true}`
-and hands the object to `set-routes` base64-encoded, so nothing in it reaches a
-shell. It is NEWER than the other verbs: an exit installed from an image built
-before it answers `404 no such endpoint`, which the app reports as "redeploy to
-enable this" rather than pretending the policy was applied. Note that a
-block-everything policy can cut the exit off from the internet, and undoing that
-needs SSH.
-
-- **Auth**: a 32-byte secret in the URL path (constant-time compared) over a
-  **pinned self-signed TLS cert**. No CA. The app pins `certSha256`.
-- **State** (in the `/etc/breach` volume, `0600`): `mgmt-secret`, `mgmt-cert.pem`,
-  `mgmt-key.pem`, and `mgmt.json` (the full handle, for recovery via
+- **Auth:** 32-байтный секрет в пути URL (сравнение constant-time) поверх
+  **pinned self-signed** серта. CA нет — приложение пинит `certSha256`.
+- **Состояние** (в томе `/etc/breach`, `0600`): `mgmt-secret`, `mgmt-cert.pem`,
+  `mgmt-key.pem`, `mgmt.json` (полный handle для восстановления через
   `docker exec breach-exit cat /etc/breach/mgmt.json`).
-- **Port**: TCP, same number as the UDP relay by default (`48000`). Open that TCP
-  port in the firewall **and the VPS provider’s panel**.
-- The cert is stable across restarts; if it ever fails to load, the daemon
-  **refuses to start** rather than silently rotating the pin.
+- **Порт:** TCP, по умолчанию тот же номер, что и UDP-релей (`48000`). Открой этот
+  **TCP**-порт и в файрволе, и в панели провайдера.
+- Серт стабилен между рестартами; если не грузится — демон **не стартует**, а не
+  молча ротирует пин.
 
-### Turning management off
+### Выключить управление
 
-Two independent switches:
-
-| Switch | Where | Effect |
+| Переключатель | Где | Эффект |
 |---|---|---|
-| **Build-time** `--build-arg MGMT=0` | `deploy/Dockerfile` | `breach-mgmt` is **never compiled or shipped** — the code isn’t in the image at all. (Published image builds with `MGMT=1`.) |
-| **Runtime** `MGMT_ENABLE=0` | `.env` / compose | The daemon isn’t started; the exit is SSH-only. The published image honors this without a rebuild. |
+| build-time `--build-arg MGMT=0` | `deploy/Dockerfile` | `breach-mgmt` вообще не компилируется и не попадает в образ |
+| runtime `MGMT_ENABLE=0` | `.env` / compose | демон не запускается; exit только по SSH |
 
-`breach-server` never links `breach-mgmt` (separate binary behind the `mgmt`
-build tag), so the exit’s data path carries none of it regardless.
+`breach-server` никогда не линкует `breach-mgmt` (отдельный бинарь за build-тегом
+`mgmt`), так что data-path его не несёт.
 
----
+## 4. Безопасность
 
-## 4. Security notes
-
-- **First SSH is trust-on-first-use.** With no `hostKeyFingerprint`, the first
-  connection accepts whatever host key is presented and reports its fingerprint
-  to pin next time. On an untrusted network prefer **key auth** (a spoofed host
-  never gets a reusable secret) or pass the provider-shown host key as
-  `hostKeyFingerprint`. The provisioner warns when you use a password with no
-  pinned fingerprint.
-- **The handle carries the admin secret.** Store it in the Android Keystore, not
-  plaintext prefs; it grants add/remove-client + stats over the exit.
-- **Provider firewall.** `install.sh` opens the port in ufw/firewalld, but an
-  external cloud firewall must be opened by hand — otherwise `ServerCheck` just
-  times out.
+- **Первый SSH — trust-on-first-use.** Без `hostKeyFingerprint` первое соединение
+  принимает любой хост-ключ и возвращает его отпечаток для пиннинга. В недоверенной
+  сети предпочитай ключ (подменённый хост не получит переиспользуемый секрет) или
+  передавай отпечаток, показанный провайдером.
+- **Handle несёт admin-секрет.** Храни в Android Keystore, не в открытых prefs.
+- **Файрвол провайдера.** `install.sh` открывает порт в ufw/firewalld, но внешний
+  облачный файрвол открывается вручную — иначе `ServerCheck` просто таймаутит.

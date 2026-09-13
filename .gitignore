@@ -20,3 +20,5 @@ sing-box/
 .DS_Store
 breachbox/
 *.png
+docs/calls_api.md
+docs/max_calls_api.md

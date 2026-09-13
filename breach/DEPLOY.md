@@ -1,103 +1,116 @@
-# breach deployment
+# Развёртывание breach
 
 ```
-[WG client]              [breach-client]            MAX TURN          [breach-server]          [WG server]
- in RU         127.0.0.1:51821  (mints creds,   155.212.x:19302      VPS :48000  127.0.0.1:51820   on VPS
- wg0 ──────────────────> pool of allocations) ──relay──────────────> (plain UDP) ────────────────> wg0
-   Endpoint=127.0.0.1:51821                                            (no MAX account needed)
+[WG-клиент]              [breach-client]           TURN-релей         [breach-server]        [WG-сервер]
+ в РФ         127.0.0.1:51821  (минт кредов,                          VPS :48000  127.0.0.1:51820  на VPS
+ wg0 ──────────────────> пул аллокаций)  ──relay──────────────────> (обычный UDP) ───────────────> wg0
+   Endpoint=127.0.0.1:51821                                          (аккаунт мессенджера не нужен)
 ```
 
-## Accounts
+Проще всего поднять сервер готовым контейнером — см. [`deploy/README.md`](deploy/README.md)
+и (по-русски) [`../docs/deploy-ru.md`](../docs/deploy-ru.md). Ниже — ручная
+обвязка WireGuard, чтобы понимать, что происходит.
 
-- **Client:** one MAX account **A** (its login token + spoofing profile go in
-  `config.json`) and the user-id of a **friend B** (`calleeId`). Minting places a
-  brief call to B every ~8 h; use a throwaway B that is friends with A so nobody
-  real is bothered. B runs nothing.
-- **Server:** no MAX account.
+## Аккаунты
 
-## 1. Server (VPS abroad)
+- **Клиент:** один аккаунт мессенджера. Для **MAX** — токен + профиль спуфинга в
+  `config.json` (`mintMode: "silent"` никого не будит; `"call"` звонит на
+  `calleeId` — тогда заведи свой второй аккаунт). Для **WB** — сессия WB ID и
+  личный чат (минт тихий, собеседник ничего не получает).
+- **Сервер:** аккаунт мессенджера не нужен.
 
-WireGuard server `wg0` (listens udp/51820), one peer = the client:
+## 1. Сервер (VPS за рубежом)
+
+WireGuard-сервер `wg0` (слушает udp/51820), один пир — клиент:
 
 ```ini
-# /etc/wireguard/wg0.conf  (server)
+# /etc/wireguard/wg0.conf  (сервер)
 [Interface]
 Address = 10.9.0.1/24
 ListenPort = 51820
 PrivateKey = <SERVER_PRIV>
 
-[Peer]                       # the client
+[Peer]                       # клиент
 PublicKey = <CLIENT_PUB>
 AllowedIPs = 10.9.0.2/32
 ```
 
 ```bash
 wg-quick up wg0
-# enable NAT so client traffic reaches the internet:
+# NAT, чтобы трафик клиента уходил в интернет:
 sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o eth0 -j MASQUERADE
 
 ./breach-server -listen :48000 -wg 127.0.0.1:51820
 ```
 
-Open inbound **udp/48000** on the VPS firewall (the TURN relay delivers here).
+Открой входящий **udp/48000** на файрволе VPS (сюда доставляет TURN-релей).
 
-## 2. Client (RU device)
+## 2. Клиент (устройство в РФ)
 
-`config.json` — MAX account A token + spoofing + friend B id (same shape as
-`config.json`; `calleeId` = B's user id).
-
-WireGuard client points at breach-client, **not** the VPS:
+WireGuard-клиент целится в breach-client, **не** в VPS:
 
 ```ini
-# wg client config
+# конфиг wg-клиента
 [Interface]
 Address = 10.9.0.2/24
 PrivateKey = <CLIENT_PRIV>
-MTU = 1280                       # leave headroom for ChannelData/relay
+MTU = 1280                       # запас под ChannelData/relay
 
 [Peer]
 PublicKey = <SERVER_PUB>
-Endpoint = 127.0.0.1:51821       # <-- breach-client, the local tunnel mouth
+Endpoint = 127.0.0.1:51821       # <-- breach-client, локальный вход туннеля
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 15
 ```
 
 ```bash
-./breach-client -config config.json -server <VPS_PUBLIC_IP>:48000 \
+# MAX
+./breach-client -config config.json -server <VPS_IP>:48000 \
     -wg-listen 127.0.0.1:51821 -streams 4 -mints 1
+# WB
+./breach-client -provider wb -wb-session wb.json -wb-chat 'chats/<id>' \
+    -server <VPS_IP>:48000 -wg-listen 127.0.0.1:51821 -streams 4
+
 wg-quick up wg-client
 ```
 
-### CRITICAL: avoid the routing loop
+### ВАЖНО: петля маршрутизации
 
-The WG client routes `0.0.0.0/0` into the tunnel, but breach-client's own traffic
-to MAX (`155.212.0.0/16` TURN + `api2.oneme.ru` for minting) must go out the
-**physical** interface, or it loops into the tunnel and deadlocks. Pin those
-routes to the real gateway:
+WG-клиент заворачивает `0.0.0.0/0` в туннель, но собственный трафик breach-client
+к TURN-релею и к API минта должен уходить через **физический** интерфейс — иначе
+он зациклится в туннеле и всё встанет. Прибей эти маршруты к реальному шлюзу:
 
 ```bash
 GW=$(ip route show default | awk '/default/{print $3; exit}')
 DEV=$(ip route show default | awk '/default/{print $5; exit}')
-ip route add 155.212.0.0/16 via $GW dev $DEV          # MAX/OK TURN edges
-ip route add $(getent ahostsv4 api2.oneme.ru | awk 'NR==1{print $1}')/32 via $GW dev $DEV
-# add VPS_PUBLIC_IP/32 via $GW too if the server is reached over the internet
-ip route add <VPS_PUBLIC_IP>/32 via $GW dev $DEV
+# TURN-рёбра провайдера: MAX — 155.212.0.0/16, WB — 176.101.92.0/24
+ip route add 155.212.0.0/16 via $GW dev $DEV
+ip route add <VPS_IP>/32 via $GW dev $DEV     # если сервер за интернетом
+# плюс /32 к API-хосту минта (api2.oneme.ru для MAX)
 ```
 
-(Run these after `wg-quick up`, or put them in `PostUp`/`PostDown`.)
+(Запускать после `wg-quick up`, либо положить в `PostUp`/`PostDown`.)
 
-## Tuning
+## Stream-режим (без WireGuard и root)
 
-- `-streams N` allocations per credential (~2.5 Mbit/s each), `-mints M`
-  credentials (each rings B once). Bandwidth ≈ M × N × ~2.5 Mbit/s, but see the
-  **account/IP throttle** in README — pushing one account too hard lowers its
-  ceiling. Start with `-streams 4 -mints 1` and scale up cautiously.
-- `-keepalive-ms` (default 50) — lower = more return padding = throttle stays
-  open under more asymmetric load, at small overhead.
+Вместо WG клиент может поднять локальный SOCKS5, а exit будет ходить наружу сам
+(QUIC поверх релея). Ни tun, ни root не нужны, петли маршрутизации нет:
 
-## Status
+```bash
+# сервер
+./breach-server -listen :48000 -socks 127.0.0.1:1 -clients /etc/breach/clients
+# клиент
+./breach-client -provider wb -wb-session wb.json -wb-chat 'chats/<id>' \
+    -server <VPS_IP>:48000 -socks 127.0.0.1:1080 \
+    -socks-token <пароль> -socks-pin <sha256 серта exit'а>
+```
 
-Prototype. Works (per-allocation throttle defeated), but: no graceful re-mint
-overlap, naive round-robin, and the account/IP-level throttle is the real ceiling
-(spread load across multiple accounts/IPs for sustained high bandwidth).
+## Тюнинг
+
+- `-streams N` — аллокаций на кред (~2.5 Мбит/с каждая), `-mints M` — кредов
+  (для MAX `"call"` каждый минт звонит; для `silent`/WB — нет). Пропускная
+  ≈ M × N × ~2.5 Мбит/с, но реальный потолок — аккаунт/IP-троттл: не долби один
+  аккаунт. Начни с `-streams 4 -mints 1`.
+- `-keepalive-ms` (по умолчанию 50) — ниже = больше обратного трафика = троттл
+  держится открытым под более асимметричной нагрузкой, ценой небольшого оверхеда.
