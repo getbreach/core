@@ -399,15 +399,32 @@ func internalParams(cfg *Config) string {
 	return string(b)
 }
 
-// turnHosts strips the "turn:"/"stun:" scheme and any "?transport=" suffix.
+// turnHosts strips the scheme and any "?transport=" suffix from advertised ICE
+// URLs, leaving the host:port the pool allocates on.
+//
+// A scheme is matched as a leading token, not as "everything before the first
+// colon": the latter also eats the host of a scheme-less "host:3478", leaving a
+// bare port behind. Providers seen in the wild always send a scheme, so this is
+// defensive — but a bare port silently allocated on is the worst way to find out
+// otherwise.
 func turnHosts(urls []string) []string {
 	out := make([]string, 0, len(urls))
 	for _, u := range urls {
-		if i := strings.IndexByte(u, ':'); i > 0 {
-			u = u[i+1:]
-		}
 		if i := strings.IndexByte(u, '?'); i >= 0 {
 			u = u[:i]
+		}
+		for _, scheme := range []string{"turns:", "turn:", "stuns:", "stun:"} {
+			rest, ok := strings.CutPrefix(u, scheme)
+			if !ok {
+				continue
+			}
+			rest = strings.TrimPrefix(rest, "//")
+			// A real scheme leaves a host:port behind it; "turn:3478" is a host
+			// named "turn" on port 3478, not a scheme with the host omitted.
+			if strings.Contains(rest, ":") {
+				u = rest
+			}
+			break
 		}
 		out = append(out, u)
 	}
