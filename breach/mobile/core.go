@@ -167,6 +167,7 @@ type core struct {
 	cfg           *maxproto.Config  // MAX identity (nil in wb mode)
 	providerName  string            // "max" | "wb"
 	wbMinters     []provider.Minter // wb mode: one minter per WB session/chat
+	credCacheDir  string            // wb mode: MAX reads this from cfg instead
 	turnTransport string            // default client<->relay transport; creds.Transport wins
 	peer          *net.UDPAddr
 	nStreams      int
@@ -241,11 +242,12 @@ func newCore(cfg *maxproto.Config, peer *net.UDPAddr) *core {
 // newCoreWB builds a core that mints via a provider.Minter (WB) instead of MAX.
 // Tunnel params are explicit (there is no maxproto.Config); everything below
 // minting — pool, DTLS-SRTP, keepalive, replenish — is the shared MAX path.
-func newCoreWB(minters []provider.Minter, peer *net.UDPAddr, streams, mints, keepaliveMs int, transport string) *core {
+func newCoreWB(minters []provider.Minter, peer *net.UDPAddr, streams, mints, keepaliveMs int, transport, credCacheDir string) *core {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &core{peer: peer, p: &pool{}, ctx: ctx, cancel: cancel, reconcile: make(chan struct{}, 1)}
 	c.providerName = "wb"
 	c.wbMinters = minters
+	c.credCacheDir = credCacheDir
 	c.nStreams = streams
 	if c.nStreams <= 0 {
 		c.nStreams = 4
@@ -412,28 +414,66 @@ func (c *core) buildPool(freshMint bool) time.Time {
 	var allCreds []*maxproto.Creds
 	if c.providerName == "wb" {
 		for mi, mtr := range c.wbMinters {
+			// Same cache the MAX path uses — the on-disk format is provider-agnostic
+			// (provider.Creds IS maxproto.Creds), only the key differs. Reusing a
+			// still-valid credential is what keeps a reconnect from placing another
+			// call: WB mints by ringing the chat's peer, so an uncached reconnect is
+			// a real notification on someone else's phone.
+			key := mtr.CacheKey()
+			var cached []*maxproto.Creds
+			if !freshMint {
+				cached = maxproto.LoadCachedCreds(c.credCacheDir, key)
+			}
+			c.log("wb minter%d: %d valid cached creds (mints=%d streams=%d)", mi, len(cached), c.nMints, c.nStreams)
+			var usable []*maxproto.Creds
 			for m := 0; m < c.nMints; m++ {
 				select {
 				case <-c.ctx.Done():
 					return earliest
 				default:
 				}
-				c.log("wb minter%d cred%d: minting...", mi, m)
-				creds, err := mtr.Mint("")
-				if err != nil {
-					c.log("wb minter%d cred%d: mint FAILED: %v", mi, m, err)
-					c.setErr("wb mint failed: %v", err)
-					continue
+				var creds *maxproto.Creds
+				fromCache := m < len(cached)
+				if fromCache {
+					creds = cached[m]
+				} else {
+					c.log("wb minter%d cred%d: minting (no cache)...", mi, m)
+					nc, err := mtr.Mint("")
+					if err != nil {
+						c.log("wb minter%d cred%d: mint FAILED: %v", mi, m, err)
+						c.setErr("wb mint failed: %v", err)
+						continue
+					}
+					creds = nc
 				}
 				result := openCred(creds)
-				c.log("wb minter%d cred%d: %d/%d allocations up", mi, m, result.opened, c.nStreams)
-				if result.opened > 0 {
-					allCreds = append(allCreds, creds)
+				src := "cache"
+				if !fromCache {
+					src = "mint"
+				}
+				c.log("wb minter%d cred%d (%s): %d/%d allocations up", mi, m, src, result.opened, c.nStreams)
+				if result.opened == 0 && result.quota > 0 && fromCache {
+					// The cached credential is spent: its relay still answers but has no
+					// allocations left for it. Only a fresh mint fixes that.
+					c.log("wb minter%d cred%d: cached cred quota exhausted, re-minting...", mi, m)
+					if nc, err := mtr.Mint(""); err == nil {
+						creds = nc
+						result = openCred(creds)
+						c.log("wb minter%d cred%d (remint): %d/%d allocations up", mi, m, result.opened, c.nStreams)
+					} else {
+						c.log("wb minter%d cred%d: re-mint FAILED: %v", mi, m, err)
+						c.setErr("wb re-mint failed: %v", err)
+					}
+				}
+				if result.quota < c.nStreams || result.opened > 0 {
+					usable = append(usable, creds)
 					if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
 						earliest = creds.ExpiresAt
 					}
 				}
 			}
+			maxproto.SaveCachedCreds(c.credCacheDir, key, usable)
+			allCreds = append(allCreds, usable...)
 		}
 	} else {
 		accounts := c.cfg.MintAccounts()

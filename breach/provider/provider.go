@@ -48,4 +48,13 @@ type Minter interface {
 
 	// Name is the provider tag ("max", "wb"), for logs.
 	Name() string
+
+	// CacheKey is a stable identity for this minter's on-disk credential cache,
+	// so a reconnect can reuse credentials instead of minting again. It must be
+	// stable across restarts and distinct per account — it is what keys the cache
+	// file. Return "" to opt out of caching.
+	//
+	// Minting is not free anywhere, but it is loudest here: a provider that mints
+	// by placing a call rings a real person every time it runs.
+	CacheKey() string
 }

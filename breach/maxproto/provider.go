@@ -23,6 +23,10 @@ func (m mintMinter) Mint(reuseLink string) (*provider.Creds, error) {
 func (m mintMinter) Reuses() bool { return m.cfg.ReuseGroupCall }
 func (m mintMinter) Name() string { return "max" }
 
+// CacheKey is the account token — the same key LoadCachedCreds/SaveCachedCreds
+// have always used, so existing cache files stay readable.
+func (m mintMinter) CacheKey() string { return m.cfg.Token }
+
 // Minters returns one provider.Minter per account to mint from (the MintAccounts
 // fan-out that scales throughput past a single account's throttle ceiling).
 func (c *Config) Minters() []provider.Minter {

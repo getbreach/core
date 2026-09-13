@@ -20,6 +20,10 @@ type Minter struct {
 	chat      string
 	callType  string // "AUDIO" (default) or "VIDEO"
 	transport string // client<->relay leg: auto|udp|tcp -> stamped on Creds
+	// Frozen at construction. It must NOT be derived from callee, which is filled
+	// in by the first resolveCallee — a key that changes mid-session would orphan
+	// the cache written before it.
+	cacheKey string
 
 	mu     sync.Mutex
 	callee string // resolved peer userID, cached after the first mint
@@ -42,7 +46,14 @@ func NewMinter(sessionPath, chat, callee, callType, transport string) (*Minter, 
 	if chat == "" && callee == "" {
 		return nil, errors.New("wbproto: need a chat or a callee to mint from")
 	}
-	return &Minter{api: api, chat: chat, callee: callee, callType: callType, transport: transport}, nil
+	return &Minter{
+		api:       api,
+		chat:      chat,
+		callee:    callee,
+		callType:  callType,
+		transport: transport,
+		cacheKey:  "wb|" + sessionPath + "|" + chat + "|" + callee,
+	}, nil
 }
 
 // Mint starts and immediately cancels one WB call, returning its TURN creds.
@@ -119,6 +130,12 @@ func (m *Minter) resolveCallee(ctx context.Context) (string, error) {
 
 // Reuses is always false: WB mints a fresh call each time.
 func (m *Minter) Reuses() bool { return false }
+
+// CacheKey identifies this account+chat pair for the credential cache. The cache
+// hashes it into a filename, so the session path inside it never lands on disk
+// in the clear; it is there so two sessions on one device cannot read each
+// other's credentials.
+func (m *Minter) CacheKey() string { return m.cacheKey }
 
 // Name tags this provider in logs.
 func (m *Minter) Name() string { return "wb" }

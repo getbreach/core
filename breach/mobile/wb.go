@@ -65,6 +65,25 @@ func WBDeviceIDFromSession(sessionPath string) string {
 	return wbproto.DeviceIDFromSession(sessionPath)
 }
 
+// WBResolvePeer resolves the single OTHER member of a personal chat and returns
+// their userID, so the app can validate a chat at pick time. chat is "chats/<id>"
+// or a bare id.
+//
+// This is exactly the lookup the minter does on its first Mint, and it is the
+// one that rejects a group: minting places a call to a specific peer, and a chat
+// with two or twenty other members has no single peer to call. Running it here
+// turns "the tunnel fails to connect, minutes later" into "this chat will not
+// work, pick another one".
+func WBResolvePeer(sessionPath, chat string) (string, error) {
+	client, err := wbproto.Load(sessionPath)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return client.ResolvePeer(ctx, chat)
+}
+
 // WBListChats returns the account's chats as JSON ({"chatViews":[...]}), so the
 // app can let the user pick which personal chat to mint TURN credentials from.
 // The chat's id is used as StartTransport's "wbChat" ("chats/<id>").

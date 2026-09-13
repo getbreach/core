@@ -147,6 +147,7 @@ func startWB(configJSON string, p Protector, logf func(string), l Logger) (*Tunn
 		WBChat      string `json:"wbChat"`
 		WBCallee    string `json:"wbCallee"`
 		WBCallType  string `json:"wbCallType"`
+		CredCache   string `json:"credCacheDir"`
 	}
 	if err := json.Unmarshal([]byte(configJSON), &wc); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
@@ -168,7 +169,7 @@ func startWB(configJSON string, p Protector, logf func(string), l Logger) (*Tunn
 	}
 	logf(fmt.Sprintf("transport starting: provider=wb server=%s mouth=%s streams=%d mints=%d chat=%s",
 		wc.Server, wgListen, wc.Streams, wc.Mints, wc.WBChat))
-	co := newCoreWB([]provider.Minter{m}, peer, wc.Streams, wc.Mints, wc.KeepaliveMs, wc.Transport)
+	co := newCoreWB([]provider.Minter{m}, peer, wc.Streams, wc.Mints, wc.KeepaliveMs, wc.Transport, wc.CredCache)
 	return launch(co, wgListen, wc.DNS, p, logf, l)
 }
 
