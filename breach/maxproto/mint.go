@@ -106,6 +106,17 @@ type Config struct {
 	// reconnect within the ~8h cred TTL reuses cached creds instead of minting
 	// (no MAX group-call/conference). Empty = always mint.
 	CredCacheDir string `json:"credCacheDir"`
+
+	// Stream (SOCKS5) mode. Like the tunnel fields above, these live here so the
+	// client can run from config alone (the setup wizard writes them). When Socks
+	// is non-empty the client serves SOCKS5 locally and the exit dials out itself
+	// — no WireGuard/sing-box and no root. Ignored on mobile (VpnService uses the
+	// UDP mouth). Empty Socks = UDP-mouth mode.
+	Socks      string `json:"socks,omitempty"`      // local SOCKS5 listen addr, e.g. 127.0.0.1:1080
+	SocksToken string `json:"socksToken,omitempty"` // this client's password on the exit
+	SocksPin   string `json:"socksPin,omitempty"`   // sha256 of the exit's stream-mode cert
+	SocksUser  string `json:"socksUser,omitempty"`  // optional auth for the local listener
+	SocksPass  string `json:"socksPass,omitempty"`
 }
 
 // MintAccounts returns one *Config per account to mint from: each is the base

@@ -67,8 +67,18 @@ Compose, env-переменные, Hy2-only, апгрейды — в [`breach/de
 cd breach && go build -o bin/breach-server ./cmd/server
 ./bin/breach-server -listen :48000 -wg 127.0.0.1:51820
 
-# клиент (сторона цензуры), MAX: получить токен по SMS и заполнить конфиг
+# клиент (сторона цензуры)
 go build -o bin/breach-client ./cmd/client
+
+# проще всего — интерактивный мастер: спросит провайдера (MAX/WB), проведёт
+# логин (SMS у MAX, ссылка+callback у WB), спросит адрес сервера и режим,
+# запишет готовый config.json и предложит сразу стартовать. Он запускается сам
+# при первом запуске без конфига, либо принудительно:
+./bin/breach-client -setup
+# дальше — просто (конфиг уже полный, флаги не нужны):
+./bin/breach-client
+
+# вручную (MAX): получить токен по SMS и заполнить конфиг
 ./bin/breach-client -login +7XXXXXXXXXX > config.json   # спросит код из SMS
 # дописать "server"/"wgListen" в config.json, затем
 ./bin/breach-client -config config.json

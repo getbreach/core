@@ -24,6 +24,7 @@ import (
 	"breach/maxproto"
 	"breach/media"
 	"breach/provider"
+	"breach/statusline"
 	"breach/turn"
 	"breach/wbproto"
 )
@@ -120,7 +121,8 @@ func main() {
 	socksUser := flag.String("socks-user", "", "optional username for the local SOCKS5 listener")
 	socksPass := flag.String("socks-pass", "", "optional password for the local SOCKS5 listener")
 	stripe := flag.Int("stripe", 16, "consecutive packets per allocation before the round-robin advances (1 = per-packet striping)")
-	providerName := flag.String("provider", "max", "TURN provider: max|wb")
+	providerName := flag.String("provider", "", "TURN provider: max|wb (default: from config's \"provider\", else max)")
+	setup := flag.Bool("setup", false, "run the interactive setup wizard (pick provider, log in, write a config), then offer to start")
 	wbSession := flag.String("wb-session", "", "provider=wb: WBID session file")
 	wbChat := flag.String("wb-chat", "", "provider=wb: personal chat 'chats/<id>' to resolve the peer from")
 	wbCallee := flag.String("wb-callee", "", "provider=wb: peer userID to call (alternative to -wb-chat)")
@@ -149,6 +151,27 @@ func main() {
 		return
 	}
 
+	// Setup wizard: explicit -setup, or a bare interactive first run with nothing
+	// configured yet. It picks a provider, logs the user in, writes a runnable
+	// config to -config, and offers to start right away. wantSetup is guarded on a
+	// TTY so headless/piped/Android runs never block on stdin — they fall through
+	// to the normal "config required" path.
+	if *setup || wantSetup(*providerName, *cfgPath, *sessionPath, *wbSession, *server, *socksListen) {
+		prov, runNow, err := runSetup(*cfgPath, *dnsFlag)
+		if err == errSetupCancelled {
+			fmt.Fprintln(os.Stderr, "setup cancelled")
+			return
+		}
+		if err != nil {
+			log.Fatalf("setup: %v", err)
+		}
+		if !runNow {
+			return
+		}
+		// The wizard wrote everything to *cfgPath; let the config drive the run.
+		*providerName = prov
+	}
+
 	rand.Read(clientID[:])
 
 	if *stripe < 1 {
@@ -156,16 +179,29 @@ func main() {
 	}
 	stripeChunk = uint64(*stripe)
 
-	// Tunnel settings default to the flags. The MAX config may override them (so
-	// an Android/no-args run works from config alone); WB takes them from flags.
+	// Tunnel settings default to the flags; the config overrides them (so an
+	// Android/no-args or wizard-written run works from config alone). Socks-mode
+	// settings live in the same locals so config can drive stream mode too.
 	srv, wgl := *server, *wgListen
 	nStreams, nMints := *streams, *mints
+	socksAddr, socksTok, socksPinV := *socksListen, *socksToken, *socksPin
+	socksU, socksP := *socksUser, *socksPass
+
+	// Resolve the provider: an explicit -provider wins; otherwise the config file
+	// declares it (wizard/WB configs carry "provider"), else MAX.
+	prov := *providerName
+	if prov == "" {
+		prov = detectProvider(*cfgPath)
+	}
+	if prov == "" {
+		prov = "max"
+	}
 
 	// The provider decides only WHERE the TURN creds come from; everything below
 	// buildPool (allocations, DTLS-SRTP, the pool) is identical for MAX and WB.
 	var minters []provider.Minter
-	switch *providerName {
-	case "", "max":
+	switch prov {
+	case "max":
 		cfg, err := loadClientConfig(*cfgPath, *sessionPath)
 		if err != nil {
 			log.Fatalf("config: %v", err)
@@ -190,16 +226,53 @@ func main() {
 		if cfg.Mints > 0 {
 			nMints = cfg.Mints
 		}
+		// Stream mode from config when no -socks flag was given.
+		if socksAddr == "" && cfg.Socks != "" {
+			socksAddr, socksTok, socksPinV = cfg.Socks, cfg.SocksToken, cfg.SocksPin
+			socksU, socksP = cfg.SocksUser, cfg.SocksPass
+		}
 		minters = cfg.Minters()
 	case "wb":
-		setResolver(*dnsFlag)
-		m, err := wbproto.NewMinter(*wbSession, *wbChat, *wbCallee, *wbCallType, *turnTransport)
+		// WB config parity with MAX: load tunnel/session/callee from the config
+		// file, then let any explicit flag override it (so both a bare config run
+		// and the old all-flags run work).
+		wc, err := loadWBConfig(*cfgPath)
+		if err != nil {
+			log.Fatalf("wb config: %v", err)
+		}
+		wbSess := firstNonEmpty(*wbSession, wc.WBSession)
+		wbCh := firstNonEmpty(*wbChat, wc.WBChat)
+		wbCe := firstNonEmpty(*wbCallee, wc.WBCallee)
+		wbCt := *wbCallType
+		if wbCt == "AUDIO" && wc.WBCallType != "" { // AUDIO is the flag default
+			wbCt = wc.WBCallType
+		}
+		transport := firstNonEmpty(*turnTransport, wc.Transport)
+		dns := firstNonEmpty(*dnsFlag, wc.DNS)
+		setResolver(dns)
+		if srv == "" {
+			srv = wc.Server
+		}
+		if wgl == "127.0.0.1:51821" && wc.WGListen != "" { // wg-listen flag default
+			wgl = wc.WGListen
+		}
+		if nStreams == 4 && wc.Streams > 0 { // streams flag default
+			nStreams = wc.Streams
+		}
+		if nMints == 2 && wc.Mints > 0 { // mints flag default
+			nMints = wc.Mints
+		}
+		if socksAddr == "" && wc.Socks != "" {
+			socksAddr, socksTok, socksPinV = wc.Socks, wc.SocksToken, wc.SocksPin
+			socksU, socksP = wc.SocksUser, wc.SocksPass
+		}
+		m, err := wbproto.NewMinter(wbSess, wbCh, wbCe, wbCt, transport)
 		if err != nil {
 			log.Fatalf("wb: %v", err)
 		}
 		minters = []provider.Minter{m}
 	default:
-		log.Fatalf("unknown -provider %q (want max|wb)", *providerName)
+		log.Fatalf("unknown -provider %q (want max|wb)", prov)
 	}
 
 	if srv == "" {
@@ -209,7 +282,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve server: %v", err)
 	}
-	streamMode := *socksListen != ""
+	streamMode := socksAddr != ""
 	if streamMode {
 		// Downstream goes to QUIC, not to a local socket. Must be in place before
 		// buildPool, which starts the per-allocation readers.
@@ -234,18 +307,30 @@ func main() {
 		log.Fatal("no allocations established")
 	}
 
+	// On a terminal the per-second stat refreshes on one sticky line and real log
+	// lines scroll above it; off a terminal it stays plain line-by-line.
+	sl := statusline.New(os.Stderr)
+	if sl.TTY() {
+		log.SetOutput(sl.Writer())
+	}
+
 	go turnKeepaliveLoop(p)
 	go remintLoop(p, minters, peer, nMints, nStreams, *turnOverride, kaInterval, expiry)
 	go func() {
 		for range time.Tick(time.Second) {
-			log.Printf("[stat] upstream=%d turnSends=%d downAll=%d downRTP=%d decFail=%d downData=%d",
+			line := fmt.Sprintf("[stat] upstream=%d turnSends=%d downAll=%d downRTP=%d decFail=%d downData=%d",
 				upCount.Load(), turn.SentPackets.Load(), downAll.Load(), downRTP.Load(), downDecFail.Load(), downData.Load())
+			if sl.TTY() {
+				sl.Set(line)
+			} else {
+				log.Print(line)
+			}
 		}
 	}()
 
 	if streamMode {
 		log.Printf("breach-client: %d allocations up, server=%s", len(p.snapshot()), srv)
-		if err := runSocksMode(p, peer, *socksListen, *socksToken, *socksPin, *socksUser, *socksPass); err != nil {
+		if err := runSocksMode(p, peer, socksAddr, socksTok, socksPinV, socksU, socksP); err != nil {
 			log.Fatalf("socks: %v", err)
 		}
 		return
@@ -430,15 +515,15 @@ func setResolver(dns string) {
 	}
 }
 
-// runLogin authenticates a phone number by SMS (handling a 2FA password if the
-// account has one), prints a config block with the resulting LOGIN token, and —
-// when sessionPath is set — saves a session so later runs skip the SMS. The
-// token is bound to the generated device identity, so both are kept together;
-// re-running -login sends a new SMS and mints a new identity.
-func runLogin(phone, host, sessionPath, deviceJSON string) error {
+// authenticateMax runs the SMS (and optional 2FA) login for a phone number and
+// returns a Config carrying the resulting LOGIN token bound to a freshly minted
+// device identity. When sessionPath is set it also saves a session so later runs
+// skip the SMS. Shared by -login (which prints a config block) and the setup
+// wizard (which folds tunnel settings in and writes a full config).
+func authenticateMax(phone, host, sessionPath, deviceJSON string) (*maxproto.Config, error) {
 	cfg, err := maxproto.NewAuthConfig(host, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Spoof only the cosmetic device fields; appVersion/buildNumber/arch stay
 	// locked to the fingerprint build. With no -device, pick a RANDOM device so
@@ -446,7 +531,7 @@ func runLogin(phone, host, sessionPath, deviceJSON string) error {
 	if deviceJSON != "" {
 		var d maxproto.DeviceInfo
 		if err := json.Unmarshal([]byte(deviceJSON), &d); err != nil {
-			return fmt.Errorf("bad -device JSON: %w", err)
+			return nil, fmt.Errorf("bad -device JSON: %w", err)
 		}
 		cfg.UserAgent = maxproto.UserAgentFor(d)
 	} else {
@@ -469,7 +554,7 @@ func runLogin(phone, host, sessionPath, deviceJSON string) error {
 		},
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cfg.Token = token
 
@@ -483,9 +568,22 @@ func runLogin(phone, host, sessionPath, deviceJSON string) error {
 
 	if sessionPath != "" {
 		if err := maxproto.SaveSession(sessionPath, maxproto.SessionFromConfig(cfg, accountID, profile)); err != nil {
-			return fmt.Errorf("saving session: %w", err)
+			return nil, fmt.Errorf("saving session: %w", err)
 		}
 		log.Printf("session saved to %s — run with -session %s to reuse it (no SMS)", sessionPath, sessionPath)
+	}
+	return cfg, nil
+}
+
+// runLogin authenticates a phone number by SMS (handling a 2FA password if the
+// account has one), prints a config block with the resulting LOGIN token, and —
+// when sessionPath is set — saves a session so later runs skip the SMS. The
+// token is bound to the generated device identity, so both are kept together;
+// re-running -login sends a new SMS and mints a new identity.
+func runLogin(phone, host, sessionPath, deviceJSON string) error {
+	cfg, err := authenticateMax(phone, host, sessionPath, deviceJSON)
+	if err != nil {
+		return err
 	}
 
 	block := map[string]any{

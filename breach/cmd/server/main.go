@@ -8,14 +8,17 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"breach/media"
 	"breach/qtun"
+	"breach/statusline"
 )
 
 const clientIDLen = 8
@@ -275,6 +278,14 @@ func main() {
 	}
 
 	s := &srv{conn: conn, wgAddr: wgAddr, hy2Addr: hy2Addr, socksAddr: socksAddr, peers: map[string]*peer{}, groups: map[string]*clientGroup{}}
+
+	// On a terminal the per-second stat refreshes on one sticky line and real log
+	// lines scroll above it; off a terminal (docker/journald/file) it stays plain
+	// line-by-line so captured logs don't fill with carriage returns.
+	sl := statusline.New(os.Stderr)
+	if sl.TTY() {
+		log.SetOutput(sl.Writer())
+	}
 	log.Printf("breach-server: tunnel(dtls-srtp,multi-client)=%s wg=%q hy2=%q socks=%q", *listen, *wg, *hy2, *socks)
 
 	go func() {
@@ -282,7 +293,12 @@ func main() {
 			s.mu.Lock()
 			np, ng := len(s.peers), len(s.groups)
 			s.mu.Unlock()
-			log.Printf("[stat] dataRx=%d txData=%d streams=%d clients=%d", rxCount.Load(), txCount.Load(), np, ng)
+			line := fmt.Sprintf("[stat] dataRx=%d txData=%d streams=%d clients=%d", rxCount.Load(), txCount.Load(), np, ng)
+			if sl.TTY() {
+				sl.Set(line)
+			} else {
+				log.Print(line)
+			}
 		}
 	}()
 

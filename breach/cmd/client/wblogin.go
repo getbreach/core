@@ -16,6 +16,12 @@ import (
 // URL, exchanges the code for tokens, and saves the WBID session to sessionPath.
 // Re-uses the device identity from an existing session file when present.
 func runWBLogin(sessionPath string) error {
+	return runWBLoginR(bufio.NewReader(os.Stdin), sessionPath)
+}
+
+// runWBLoginR is runWBLogin reading the callback URL from r, so the setup wizard
+// can drive it with the same stdin reader it uses for its other prompts.
+func runWBLoginR(r *bufio.Reader, sessionPath string) error {
 	if sessionPath == "" {
 		return fmt.Errorf("need -wb-session <file> to save the session to")
 	}
@@ -29,7 +35,7 @@ func runWBLogin(sessionPath string) error {
 	fmt.Fprint(os.Stderr, "\nAfter signing in the browser lands on a callback URL.\n")
 	fmt.Fprint(os.Stderr, "Paste the FULL callback URL here: ")
 
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	line, err := r.ReadString('\n')
 	if err != nil && strings.TrimSpace(line) == "" {
 		return fmt.Errorf("read callback URL: %w", err)
 	}
