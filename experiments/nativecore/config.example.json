@@ -1,0 +1,19 @@
+{
+  "mode": "turn",
+  "turn": {
+    "provider": "max",
+    "token": "REPLACE_WITH_MAX_TOKEN",
+    "deviceId": "REPLACE_WITH_DEVICE_ID",
+    "server": "203.0.113.10:48000",
+    "mintMode": "silent",
+    "streams": 4,
+    "mints": 1,
+    "turnTransport": "auto"
+  },
+  "password": "REPLACE_WITH_HY2_PASSWORD",
+  "tls": { "serverName": "vpn.example.com" },
+  "inbound": "socks",
+  "socksListen": "127.0.0.1:1080",
+  "routing": { "defaultAction": "tunnel" },
+  "startupTimeoutSeconds": 90
+}

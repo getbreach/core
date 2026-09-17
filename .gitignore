@@ -1,6 +1,7 @@
 # secrets — never commit real MAX tokens
 config.json
 **/config.json
+/breach/config.native.json
 
 # build artifacts
 /maxmint/maxmint

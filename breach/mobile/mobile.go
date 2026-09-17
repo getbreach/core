@@ -77,6 +77,17 @@ type Tunnel struct {
 	stopped   bool
 }
 
+// LocalAddress returns the bound UDP mouth, including an OS-selected port when
+// wgListen was 127.0.0.1:0. This lets an embedded client avoid fixed-port clashes.
+func (t *Tunnel) LocalAddress() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.core == nil || t.core.wgConn == nil {
+		return ""
+	}
+	return t.core.wgConn.LocalAddr().String()
+}
+
 var protectMu sync.Mutex
 
 // StartTransport launches the breach transport with a JSON config (same schema as
@@ -364,6 +375,7 @@ func clearHooks() {
 	protectMu.Lock()
 	turn.Control = nil
 	maxproto.Control = nil
+	wbproto.Control = nil
 	protectMu.Unlock()
 }
 
