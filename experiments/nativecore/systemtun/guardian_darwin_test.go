@@ -30,6 +30,27 @@ func TestRouteGuardianHelper(t *testing.T) {
 		t.Skip("subprocess helper")
 	}
 	if os.Getenv("BREACH_GUARDIAN_REAL") == "1" {
+		if iface := os.Getenv("BREACH_GUARDIAN_TEST_BRIDGE"); iface != "" {
+			if os.Geteuid() != 0 {
+				t.Fatal("kernel guardian fixture requires root")
+			}
+			// Substitute only discovery of the physical gateway. All scoped
+			// queries, additions and deletions go to the real kernel table.
+			manager := newRouteManager(func(ctx context.Context, path string, args ...string) (string, error) {
+				if len(args) == 4 && args[1] == "get" && args[3] == "default" {
+					if args[2] == "-inet6" {
+						return "", errRouteNotFound
+					}
+					return fmt.Sprintf("gateway: 198.19.254.2\ninterface: %s\nflags: <UP,GATEWAY>\n", iface), nil
+				}
+				return runCommand(ctx, path, args...)
+			})
+			if err := serveRouteGuardian(os.Stdin, os.Stdout, manager); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
 		if err := RunRouteGuardian(os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
