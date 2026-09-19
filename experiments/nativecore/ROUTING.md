@@ -85,6 +85,10 @@ TUN-профиле есть direct. Сокеты привязываются че
 Автоматическая настройка маршрутов/DNS и kill switch пока не входят в CLI.
 SOCKS-режим без системного TUN не требует directInterface.
 
+Обновление 2026-09-18: macOS поддерживает utun и `autoRoute`, с привязкой внешних
+сокетов через IP_BOUND_IF/IPV6_BOUND_IF и временным системным DNS.
+Настройка и статус системных проверок: [MACOS.md](MACOS.md).
+
 ## Geosite / GeoIP без sing-box
 
 Нативный JSON списка:

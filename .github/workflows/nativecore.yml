@@ -38,4 +38,6 @@ jobs:
       - if: runner.os == 'Linux'
         run: sh scripts/linux-tun.sh
       - if: runner.os == 'macOS'
+        run: sh scripts/macos-tun.sh
+      - if: runner.os == 'macOS'
         run: sh scripts/apple-link.sh "$RUNNER_TEMP/nativecore-apple"

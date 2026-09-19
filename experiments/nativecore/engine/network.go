@@ -30,13 +30,42 @@ func networkSnapshot() (string, error) {
 	return strings.Join(parts, "|"), nil
 }
 
-// Polling covers interface/address changes without privileged platform APIs.
-// A large wall-clock gap also catches suspend/resume. Same-address route-only
-// changes are recovered by TURN health checks / QUIC idle timeout.
-func watchNetwork(ctx context.Context, changed func()) {
+// Track interface changes, route repairs, recovery after offline periods and
+// wall-clock gaps (sleep). Retry preparation before resetting the transport.
+type networkTracker struct {
+	snapshot       string
+	valid, pending bool
+	last           int64
+}
+
+func (n *networkTracker) observe(now int64, snapshot string, err error) {
+	if n.last != 0 && now-n.last > int64(10*time.Second) {
+		n.pending = true
+	}
+	n.last = now
+	if err != nil {
+		n.pending = true
+		return
+	}
+	if n.valid && n.snapshot != snapshot {
+		n.pending = true
+	}
+	n.snapshot, n.valid = snapshot, true
+}
+func (n *networkTracker) prepared(changed bool, err error) bool {
+	if err != nil {
+		n.pending = true
+		return false
+	}
+	reset := n.pending || changed
+	n.pending = false
+	return reset
+}
+
+func watchNetwork(ctx context.Context, prepare func(context.Context) (bool, error), changed func(), report func(error)) {
 	before, err := networkSnapshot()
-	valid := err == nil
-	last := time.Now().UnixNano()
+	state := networkTracker{snapshot: before, valid: err == nil, last: time.Now().UnixNano()}
+	lastError := ""
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -45,14 +74,29 @@ func watchNetwork(ctx context.Context, changed func()) {
 			return
 		case <-ticker.C:
 		}
-		now := time.Now().UnixNano()
-		after, err := networkSnapshot()
-		if err == nil {
-			if valid && (before != after || now-last > int64(10*time.Second)) {
-				changed()
-			}
-			before, valid = after, true
+		after, snapshotErr := networkSnapshot()
+		state.observe(time.Now().UnixNano(), after, snapshotErr)
+		repaired := false
+		var err error
+		if prepare != nil {
+			repaired, err = prepare(ctx)
 		}
-		last = now
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			err = snapshotErr
+		}
+		if err != nil {
+			if err.Error() != lastError && report != nil {
+				report(err)
+			}
+			lastError = err.Error()
+		} else {
+			lastError = ""
+		}
+		if state.prepared(repaired, err) {
+			changed()
+		}
 	}
 }

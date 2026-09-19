@@ -1,7 +1,7 @@
 # Единый Breach CLI
 
 Реализовано 2026-09-17: один исполняемый файл и один конфиг для
-MAX/WB TURN → DTLS-SRTP → Hy2, с локальным SOCKS5 или Linux TUN/gVisor.
+MAX/WB TURN → DTLS-SRTP → Hy2, с локальным SOCKS5 или TUN/gVisor.
 Для запуска не нужны sing-box, WireGuard, qtun или отдельный breach-client.
 
 ```sh
@@ -28,9 +28,10 @@ TURN transport и cache. Для WB используются wbSession/wbChat/wbC
 - `mode: direct` — Hy2 напрямую по `remote`, без TURN (лабораторный режим).
 - `startupTimeoutSeconds`: 1–600, по умолчанию 90; ограничивает ожидание Hy2.
 - SOCKS доступен только на loopback, TCP CONNECT и UDP ASSOCIATE.
-- TUN пока Linux, маршруты/MTU/DNS задаются вручную. `directInterface` нужен
+- Linux TUN: маршруты/MTU/DNS задаются вручную. `directInterface` нужен
   для исходящих внешних сокетов и direct-правил, чтобы избежать петли в TUN.
   На выбранном физическом интерфейсе должен сохраняться рабочий маршрут.
+- macOS utun: есть `autoRoute` с временным DNS, см. [MACOS.md](MACOS.md).
 - Пути к cache, WB session, наборам правил и FakeIP state лучше задавать
   абсолютными: относительные пути отсчитываются от рабочей директории процесса.
 
@@ -66,14 +67,17 @@ TURN transport и cache. Для WB используются wbSession/wbChat/wbC
 
 TURN-пул переиспользуется из `breach/mobile`, без копирования протокольного кода.
 Между ним и Hy2 пока внутренний UDP loopback на случайном порту, а не очередь
-в памяти. Всё работает внутри одного процесса; второй executable не запускается.
+в памяти. Передача трафика работает внутри одного процесса. На macOS autoRoute дополнительно
+запускает scutil для временного DNS и служебный процесс из того же бинаря
+для владения scoped-маршрутами и очистки после SIGKILL родителя.
 В библиотеке TURN остаются глобальные DNS/socket hooks, поэтому движок разрешает
 только один встроенный TURN-клиент на процесс и восстанавливает прежний resolver
 при остановке. Эти hooks ещё нужно сделать независимыми для нескольких экземпляров.
 
 Общий engine компилируется под Linux, Windows, macOS, Android и iOS.
-Это не добавляет TUN-адаптеры Windows/macOS, настольное per-app разделение,
-автоматические системные маршруты, kill switch или готовое iOS-приложение.
+С 2026-09-18 добавлен macOS utun с автоматической настройкой. Windows TUN,
+настольное per-app разделение, Linux auto routes, kill switch и готовое
+iOS-приложение остаются отдельной работой.
 Android-приложение пока использует свой существующий lifecycle/redialer;
 перевод приложения на общий engine этим изменением не сделан.
 

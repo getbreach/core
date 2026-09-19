@@ -2,6 +2,8 @@
 config.json
 **/config.json
 /breach/config.native.json
+/breach/config.macos.json
+/breach/native-macos-fakeip.jsonl
 
 # build artifacts
 /maxmint/maxmint

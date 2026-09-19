@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"runtime"
 
 	"breach-nativecore/hy2"
 	"breach-nativecore/routing"
+	"breach-nativecore/systemtun"
 	"breach/maxproto"
 	"breach/wbproto"
 )
@@ -29,12 +31,16 @@ type Config struct {
 	Interface             string          `json:"interface"`
 	DirectInterface       string          `json:"directInterface,omitempty"`
 	MTU                   int             `json:"mtu"`
+	AutoRoute             bool            `json:"autoRoute,omitempty"`
 	Routing               routing.Config  `json:"routing"`
 	StartupTimeoutSeconds int             `json:"startupTimeoutSeconds,omitempty"`
 }
 
 func Load(path, defaultMode string) (Config, error) {
 	c := Config{Mode: defaultMode, Inbound: "socks", SOCKSListen: "127.0.0.1:1080", Interface: "breach0", MTU: 1280, StartupTimeoutSeconds: 90}
+	if runtime.GOOS == "darwin" {
+		c.Interface = "auto"
+	}
 	if defaultMode == "pipe" {
 		c.Remote = "127.0.0.1:51821"
 	}
@@ -105,11 +111,22 @@ func (c Config) Validate() error {
 	if err := routing.Validate(c.Routing); err != nil {
 		return err
 	}
+	if c.AutoRoute {
+		if !systemtun.Supported() {
+			return errors.New("autoRoute is currently supported only on macOS")
+		}
+		if c.Inbound != "tun" {
+			return errors.New("autoRoute requires inbound=tun")
+		}
+		if !c.Routing.DNS.FakeIP || c.Routing.DNS.StateFile == "" {
+			return errors.New("autoRoute requires routing.dns.fakeIP and a persistent stateFile")
+		}
+	}
 	hasDirect := c.Routing.DefaultAction == "direct"
 	for _, rule := range c.Routing.Rules {
 		hasDirect = hasDirect || rule.Action == "direct"
 	}
-	if c.Inbound == "tun" && c.DirectInterface == "" && (hasDirect || c.Mode != "pipe") {
+	if c.Inbound == "tun" && c.DirectInterface == "" && !c.AutoRoute && (hasDirect || c.Mode != "pipe") {
 		return errors.New("TUN requires directInterface to keep outer and direct sockets outside the tunnel")
 	}
 	return nil

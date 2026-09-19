@@ -12,6 +12,7 @@ import (
 
 	"breach-nativecore/engine"
 	"breach-nativecore/geodata"
+	"breach-nativecore/systemtun"
 )
 
 func Main(defaultMode string) {
@@ -27,6 +28,11 @@ func run(args []string, defaultMode string) error {
 		args = args[1:]
 	}
 	switch command {
+	case "internal-route-guardian":
+		if len(args) != 0 {
+			return errors.New("route guardian takes no arguments")
+		}
+		return systemtun.RunRouteGuardian(os.Stdin, os.Stdout)
 	case "run", "check":
 		f := flag.NewFlagSet("breach "+command, flag.ContinueOnError)
 		path := f.String("config", "", "private JSON config")
