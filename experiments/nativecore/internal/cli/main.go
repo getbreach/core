@@ -12,6 +12,7 @@ import (
 
 	"breach-nativecore/engine"
 	"breach-nativecore/geodata"
+	"breach-nativecore/internal/dashboard"
 	"breach-nativecore/systemtun"
 )
 
@@ -33,7 +34,7 @@ func run(args []string, defaultMode string) error {
 			return errors.New("route guardian takes no arguments")
 		}
 		return systemtun.RunRouteGuardian(os.Stdin, os.Stdout)
-	case "run", "check":
+	case "run", "check", "tui":
 		f := flag.NewFlagSet("breach "+command, flag.ContinueOnError)
 		path := f.String("config", "", "private JSON config")
 		if err := f.Parse(args); err != nil {
@@ -52,6 +53,9 @@ func run(args []string, defaultMode string) error {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
+		if command == "tui" {
+			return dashboard.Run(ctx, cfg)
+		}
 		return engine.Run(ctx, cfg, log.Printf)
 	case "convert-geodata":
 		f := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -72,6 +76,6 @@ func run(args []string, defaultMode string) error {
 		fmt.Println(tags)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q; use run, check or convert-geodata", command)
+		return fmt.Errorf("unknown command %q; use run, tui, check or convert-geodata", command)
 	}
 }

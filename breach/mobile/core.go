@@ -26,6 +26,7 @@ import (
 const diagEventLimit = 64
 
 type stream struct {
+	cred         *maxproto.Creds
 	a            *turn.Alloc
 	sess         *media.Session
 	refreshFails int
@@ -118,6 +119,29 @@ func (p *pool) set(s []*stream) []*stream {
 	return old
 }
 
+// replace keeps a retained allocation only if it is still in the live pool.
+// A health check may have removed it while a resize was opening other streams.
+func (p *pool) replace(candidates []*stream, retained map[*stream]bool) (old, live []*stream) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	present := make(map[*stream]bool, len(p.streams))
+	for _, s := range p.streams {
+		present[s] = true
+	}
+	for _, s := range candidates {
+		if streamOpen(s) && (!retained[s] || present[s]) {
+			live = append(live, s)
+		}
+	}
+	old = p.streams
+	if len(live) > 0 {
+		p.streams = live
+	} else {
+		old = nil
+	}
+	return
+}
+
 func (p *pool) snapshot() []*stream {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -183,7 +207,13 @@ type core struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	openAllocation func(*maxproto.Creds, int) (*stream, error)
+
 	logf func(string) // mirrors pool build progress to the app Logs screen
+
+	requested        atomic.Pointer[poolSettings]
+	applied          atomic.Uint64
+	credentialGroups map[string][]*maxproto.Creds // buildMu
 
 	buildMu      sync.Mutex        // serializes buildPool (start/remint/emergency-rebuild)
 	credsMu      sync.Mutex        // guards creds
@@ -236,6 +266,8 @@ func newCore(cfg *maxproto.Config, peer *net.UDPAddr) *core {
 	rand.Read(c.clientID[:])
 	c.lastErr.Store("")
 	c.logf = func(string) {}
+	c.initLimits()
+	c.openAllocation = c.openOne
 	return c
 }
 
@@ -264,6 +296,8 @@ func newCoreWB(minters []provider.Minter, peer *net.UDPAddr, streams, mints, kee
 	rand.Read(c.clientID[:])
 	c.lastErr.Store("")
 	c.logf = func(string) {}
+	c.initLimits()
+	c.openAllocation = c.openOne
 	return c
 }
 
@@ -319,21 +353,13 @@ func (c *core) stop() {
 	if c.wgConn != nil {
 		c.wgConn.Close() // unblocks uplinkLoop's ReadFromUDP
 	}
-	// Drain repeatedly: a replenish() that started before cancel may still add a
-	// stream after the first drain, and every activated stream MUST be closed or
-	// its reader goroutine blocks on In() forever and wg.Wait() deadlocks.
-	for i := 0; i < 5; i++ {
-		for _, s := range c.p.set(nil) {
-			s.close()
-		}
-		if c.p.length() == 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Wait for pool mutations before the final drain. No builder may publish
+	// a stream after this point, otherwise its reader could keep wg.Wait alive.
+	c.buildMu.Lock()
 	for _, s := range c.p.set(nil) {
 		s.close()
 	}
+	c.buildMu.Unlock()
 	c.wg.Wait()
 }
 
@@ -375,10 +401,30 @@ func (c *core) buildPool(freshMint bool) time.Time {
 		return time.Time{}
 	}
 	defer c.buildMu.Unlock()
+	if c.ctx.Err() != nil {
+		return time.Time{}
+	}
+	settings := c.requested.Load()
+	c.nMints, c.nStreams = settings.Mints, settings.Streams
 	c.log("building allocation pool (freshMint=%t)", freshMint)
 	earliest := time.Time{}
 	var newStreams []*stream
 	var newStreamsMu sync.Mutex
+	previous := c.p.snapshot()
+	retained := make(map[*stream]bool)
+	for _, s := range previous {
+		retained[s] = true
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			for _, s := range newStreams {
+				if !retained[s] {
+					s.close()
+				}
+			}
+		}
+	}()
 
 	type openResult struct {
 		opened int
@@ -389,12 +435,20 @@ func (c *core) buildPool(freshMint bool) time.Time {
 		var wg sync.WaitGroup
 		var opened atomic.Int64
 		var quota atomic.Int64
-		for i := 0; i < c.nStreams; i++ {
+		reused := 0
+		for _, s := range previous {
+			if s.cred == creds && streamOpen(s) && !s.isStale(time.Now()) && reused < c.nStreams {
+				newStreams = append(newStreams, s)
+				reused++
+				opened.Add(1)
+			}
+		}
+		for i := reused; i < c.nStreams; i++ {
 			idx := i
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s, err := c.openOne(creds, idx)
+				s, err := c.openAllocation(creds, idx)
 				if err != nil {
 					if turn.ErrorCode(err) == 486 {
 						quota.Add(1)
@@ -404,6 +458,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 				newStreamsMu.Lock()
 				newStreams = append(newStreams, s)
 				newStreamsMu.Unlock()
+				c.activate(s)
 				opened.Add(1)
 			}()
 		}
@@ -422,7 +477,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 			key := mtr.CacheKey()
 			var cached []*maxproto.Creds
 			if !freshMint {
-				cached = maxproto.LoadCachedCreds(c.credCacheDir, key)
+				cached = c.cachedCreds(c.credCacheDir, key)
 			}
 			c.log("wb minter%d: %d valid cached creds (mints=%d streams=%d)", mi, len(cached), c.nMints, c.nStreams)
 			var usable []*maxproto.Creds
@@ -472,7 +527,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					}
 				}
 			}
-			maxproto.SaveCachedCreds(c.credCacheDir, key, usable)
+			c.rememberCreds(c.credCacheDir, key, usable, cached)
 			allCreds = append(allCreds, usable...)
 		}
 	} else {
@@ -480,7 +535,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 		for ai, acfg := range accounts {
 			var cached []*maxproto.Creds
 			if !freshMint {
-				cached = maxproto.LoadCachedCreds(c.cfg.CredCacheDir, acfg.Token)
+				cached = c.cachedCreds(c.cfg.CredCacheDir, acfg.Token)
 			}
 			c.log("acct%d: %d valid cached creds (mints=%d streams=%d)", ai, len(cached), c.nMints, c.nStreams)
 			var usable []*maxproto.Creds
@@ -549,40 +604,52 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					}
 				}
 			}
-			maxproto.SaveCachedCreds(c.cfg.CredCacheDir, acfg.Token, usable)
+			c.rememberCreds(c.cfg.CredCacheDir, acfg.Token, usable, cached)
 			allCreds = append(allCreds, usable...)
 		}
 	}
 
 	if c.ctx.Err() != nil {
-		for _, s := range newStreams {
-			s.close()
-		}
 		return earliest
 	}
-
+	live := newStreams[:0]
+	for _, s := range newStreams {
+		if streamOpen(s) {
+			live = append(live, s)
+		}
+	}
+	newStreams = live
 	if len(newStreams) > 0 {
-		oldStreams := c.p.set(newStreams)
+		oldStreams, selectedStreams := c.p.replace(newStreams, retained)
+		newStreams = selectedStreams
+		selected := make(map[*stream]bool, len(newStreams))
 		for _, s := range newStreams {
-			c.activate(s)
+			selected[s] = true
 		}
 		for _, s := range oldStreams {
-			s.close()
+			if !selected[s] {
+				s.close()
+			}
 		}
-		c.log("allocation pool activated: %d stream(s)", len(newStreams))
+		committed = len(newStreams) > 0
+		c.log("allocation pool active: %d stream(s); existing allocations reused", len(newStreams))
 	}
 
 	if len(allCreds) > 0 {
 		c.credsMu.Lock()
 		c.creds = allCreds
 		c.credsMu.Unlock()
-		c.targetAllocs.Store(int64(len(allCreds) * c.nStreams))
+
+	}
+	target := c.accountCount() * c.nMints * c.nStreams
+	c.targetAllocs.Store(int64(target))
+	if committed && c.p.length() == target {
+		c.applied.Store(settings.Version)
 	}
 	c.updateHealthyCount()
 	if !earliest.IsZero() {
 		c.credsExpiry.Store(earliest.Unix())
 	}
-	c.wakeReconciler()
 	return earliest
 }
 
@@ -601,13 +668,17 @@ func (c *core) openOne(creds *maxproto.Creds, i int) (*stream, error) {
 		c.setErr("alloc (%s): %v", host, err)
 		return nil, err
 	}
-	sess, err := media.Client(a.NetConn())
+	stopCancel := context.AfterFunc(c.ctx, func() { a.Close() })
+	defer stopCancel()
+	handshakeCtx, stopHandshake := context.WithTimeout(c.ctx, 10*time.Second)
+	defer stopHandshake()
+	sess, err := media.ClientContext(handshakeCtx, a.NetConn())
 	if err != nil {
 		c.setErr("dtls (%s): %v", host, err)
 		a.Close()
 		return nil, err
 	}
-	return &stream{a: a, sess: sess, createdAt: time.Now(), done: make(chan struct{})}, nil
+	return &stream{cred: creds, a: a, sess: sess, createdAt: time.Now(), done: make(chan struct{})}, nil
 }
 
 // activate wires a live stream's reader + keepalive goroutines.
@@ -620,8 +691,10 @@ func (c *core) activate(s *stream) {
 // dropStream removes a dead allocation from the pool (idempotent) and frees it,
 // keeping the live count honest so pick() stops selecting a zombie.
 func (c *core) dropStream(s *stream) {
-	if c.p.remove(s) {
-		s.abort()
+	removed := c.p.remove(s)
+	// A new stream may fail before a resize publishes it into the pool.
+	s.abort()
+	if removed {
 		c.updateHealthyCount()
 		c.log("allocation died -> %d in pool (target %d)", c.p.length(), c.targetAllocs.Load())
 		c.wakeReconciler()
@@ -647,7 +720,7 @@ func (c *core) replenishLoop() {
 
 		target := c.targetAllocs.Load()
 		progress := false
-		if target == 0 {
+		if c.requested.Load().Version != c.applied.Load() || target == 0 {
 			before := c.p.length()
 			c.buildPool(false)
 			progress = c.p.length() > before
@@ -710,16 +783,32 @@ func (c *core) replenish() replenishResult {
 	var wg sync.WaitGroup
 	var opened atomic.Int64
 	var quota atomic.Int64
-	for k := 0; k < need; k++ {
+	type vacancy struct {
+		cr  *maxproto.Creds
+		idx int
+	}
+	var missing []vacancy
+	active := c.p.snapshot()
+	for _, cr := range creds {
+		count := 0
+		for _, s := range active {
+			if s.cred == cr && streamOpen(s) {
+				count++
+			}
+		}
+		for idx := count; idx < c.nStreams && len(missing) < need; idx++ {
+			missing = append(missing, vacancy{cr, idx})
+		}
+	}
+	for _, slot := range missing {
 		if c.ctx.Err() != nil {
 			break
 		}
-		cr := creds[k%len(creds)]
-		idx := k
+		cr, idx := slot.cr, slot.idx
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, err := c.openOne(cr, idx)
+			s, err := c.openAllocation(cr, idx)
 			if err != nil {
 				if turn.ErrorCode(err) == 486 {
 					quota.Add(1)

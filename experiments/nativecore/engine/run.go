@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -83,18 +84,103 @@ func permanent(err error) bool {
 // Run keeps the inbound and router alive across session replacements, including
 // FakeIP state. It returns only on shutdown or an unrecoverable error.
 func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
-	parent := ctx
-	if err := cfg.Validate(); err != nil {
-		return err
+	return RunObserved(ctx, cfg, logf, nil)
+}
+
+// RunObserved runs one engine lifetime. Runtime additionally allows local
+// inbounds to be replaced without replacing the TURN pool or Hy2 connection.
+func RunObserved(ctx context.Context, cfg Config, logf func(string, ...any), monitor *Monitor) error {
+	rt := NewRuntime(ctx)
+	defer rt.Close()
+	return rt.RunObserved(ctx, cfg, logf, monitor)
+}
+
+// Runtime owns the transport across sequential inbound runs. The caller must
+// wait for RunObserved to finish before Close. Canceling an inbound run does not
+// cancel the shared transport; Close (or the parent context) ends its lifetime.
+type Runtime struct {
+	ctx          context.Context
+	cancel       context.CancelFunc
+	cleanup      []func()
+	r            *reconnect.Client
+	turn         *breachmobile.Tunnel
+	control      routing.Control
+	transportKey string
+}
+
+func NewRuntime(parent context.Context) *Runtime {
+	ctx, cancel := context.WithCancel(parent)
+	return &Runtime{ctx: ctx, cancel: cancel}
+}
+func (rt *Runtime) Close() {
+	rt.cancel()
+	rt.release()
+}
+func (rt *Runtime) release() {
+	for i := len(rt.cleanup) - 1; i >= 0; i-- {
+		rt.cleanup[i]()
 	}
-	if cfg.AutoRoute && os.Geteuid() != 0 {
-		return errors.New("automatic macOS TUN requires root; run breach with sudo")
-	}
+	rt.cleanup = nil
+	rt.r = nil
+	rt.turn = nil
+	rt.control = nil
+	rt.transportKey = ""
+}
+func (rt *Runtime) RunObserved(ctx context.Context, cfg Config, logf func(string, ...any), monitor *Monitor) error {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	monitor.update(func() {
+		if monitor.started.IsZero() {
+			monitor.started = time.Now()
+		}
+		monitor.phase = "starting"
+		monitor.ready = false
+		monitor.b = nil
+		monitor.device = ""
+		monitor.lastError = ""
+		monitor.networkError = ""
+	})
+	err := rt.runInbound(ctx, cfg, logf, monitor)
+	monitor.update(func() {
+		monitor.phase = "stopped"
+		monitor.ready = false
+		monitor.b = nil
+		if err != nil && !errors.Is(err, context.Canceled) {
+			monitor.phase = "error"
+			monitor.lastError = err.Error()
+		}
+	})
+	return err
+}
+func (rt *Runtime) ensure(cfg Config, logf func(string, ...any), monitor *Monitor) (err error) {
+	if cfg.AutoRoute && cfg.DirectInterface == "" {
+		cfg.DirectInterface = "auto"
+	}
+	keyBytes, _ := json.Marshal(struct {
+		Mode, Remote, Password, Direct string
+		TLS                            hy2.TLSOptions
+		Turn                           json.RawMessage
+	}{cfg.Mode, cfg.Remote, cfg.Password, cfg.DirectInterface, cfg.TLS, cfg.Turn})
+	key := string(keyBytes)
+	if rt.r != nil {
+		if key != rt.transportKey {
+			return errors.New("inbound switch cannot change shared transport settings")
+		}
+		select {
+		case <-rt.r.Done():
+			return rt.r.Err()
+		default:
+		}
+		return nil
+	}
+	rt.transportKey = key
+	defer func() {
+		if err != nil {
+			rt.release()
+		}
+	}()
+	ctx := rt.ctx
 	if cfg.AutoRoute && cfg.DirectInterface == "" {
 		cfg.DirectInterface = "auto"
 	}
@@ -112,7 +198,7 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 		if !turnOwner.TryLock() {
 			return errors.New("only one embedded TURN engine may run per process")
 		}
-		defer turnOwner.Unlock()
+		rt.cleanup = append(rt.cleanup, turnOwner.Unlock)
 		body, err := cfg.turnJSON()
 		if err != nil {
 			return err
@@ -126,7 +212,8 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 			net.DefaultResolver = previousResolver
 			return err
 		}
-		defer func() { turn.Stop(); net.DefaultResolver = previousResolver }()
+		rt.cleanup = append(rt.cleanup, func() { turn.Stop(); net.DefaultResolver = previousResolver })
+		monitor.update(func() { monitor.turn = turn })
 		remote, mode = turn.LocalAddress(), "pipe"
 		logf("TURN embedded in this process; private UDP handoff on %s", remote)
 	}
@@ -138,6 +225,9 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 		if err != nil {
 			return nil, err
 		}
+		if monitor != nil {
+			pc.SetMeter(&monitor.wire)
+		}
 		c, err := hy2.Dial(ctx, pc, peer, cfg.Password, cfg.TLS)
 		if err != nil {
 			return nil, err
@@ -148,7 +238,31 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 		}
 		return c, nil
 	}, reconnect.Options{Logf: logf, Permanent: permanent})
-	defer r.Close()
+	rt.cleanup = append(rt.cleanup, func() { _ = r.Close() })
+	monitor.update(func() { monitor.r = r })
+	rt.r, rt.turn, rt.control = r, turn, control
+	return nil
+}
+func (rt *Runtime) runInbound(ctx context.Context, cfg Config, logf func(string, ...any), monitor *Monitor) error {
+	parent := ctx
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if cfg.AutoRoute && os.Geteuid() != 0 {
+		return errors.New("automatic macOS TUN requires root; run breach with sudo")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := rt.ensure(cfg, logf, monitor); err != nil {
+		return err
+	}
+	if cfg.AutoRoute && cfg.DirectInterface == "" {
+		cfg.DirectInterface = "auto"
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r, turn, control := rt.r, rt.turn, rt.control
 	startup, stop := context.WithTimeout(ctx, time.Duration(cfg.StartupTimeoutSeconds)*time.Second)
 	err := r.WaitReady(startup)
 	stop()
@@ -174,6 +288,7 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 			return err
 		}
 		defer ln.Close()
+		monitor.update(func() { monitor.device = ln.Addr().String(); monitor.ready = true; monitor.phase = "ready" })
 		logf("SOCKS5 ready on %s (TCP + UDP over Hy2)", ln.Addr())
 	} else {
 		b, err = bridge.New(router, bridge.Options{MTU: cfg.MTU})
@@ -181,6 +296,7 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 			return err
 		}
 		defer b.Close()
+		monitor.update(func() { monitor.b = b })
 		tun, err = packetio.OpenTUN(cfg.Interface)
 		if err != nil {
 			return err
@@ -198,6 +314,7 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 		} else {
 			logf("TUN %s ready; set MTU=%d and routes/DNS manually", tun.Name(), cfg.MTU)
 		}
+		monitor.update(func() { monitor.device = tun.Name(); monitor.ready = true; monitor.phase = "ready" })
 	}
 	var wg sync.WaitGroup
 	// Register this after the resource defers so workers stop before teardown.
@@ -219,7 +336,16 @@ func Run(ctx context.Context, cfg Config, logf func(string, ...any)) error {
 		defer wg.Done()
 		var prepare func(context.Context) (bool, error)
 		if network != nil {
-			prepare = network.Refresh
+			prepare = func(ctx context.Context) (bool, error) {
+				changed, err := network.Refresh(ctx)
+				monitor.update(func() {
+					monitor.networkError = ""
+					if err != nil {
+						monitor.networkError = err.Error()
+					}
+				})
+				return changed, err
+			}
 		}
 		watchNetwork(ctx, prepare, func() {
 			logf("Network changed or system resumed; rebuilding transport")

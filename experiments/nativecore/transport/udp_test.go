@@ -99,6 +99,8 @@ func TestPipeRejectsUnexpectedSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	meter := &Meter{}
+	c.SetMeter(meter)
 	other, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -115,5 +117,17 @@ func TestPipeRejectsUnexpectedSources(t *testing.T) {
 	}
 	if !bytes.Equal(buf[:n], []byte("valid")) {
 		t.Fatalf("accepted %q", buf[:n])
+	}
+	if got := meter.Snapshot(); got.DownBytes != 5 || got.DownPackets != 1 {
+		t.Fatalf("meter counted rejected packets: %+v", got)
+	}
+	if _, err = c.WriteTo([]byte("send"), peer.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.WriteTo([]byte("rejected"), other.LocalAddr()); err == nil {
+		t.Fatal("accepted unexpected destination")
+	}
+	if got := meter.Snapshot(); got.UpBytes != 4 || got.UpPackets != 1 {
+		t.Fatalf("meter counted rejected writes: %+v", got)
 	}
 }

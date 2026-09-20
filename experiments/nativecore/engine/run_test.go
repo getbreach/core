@@ -69,8 +69,9 @@ func TestSOCKSListenerSurvivesRealServerRestart(t *testing.T) {
 	done := make(chan error, 1)
 	ready := make(chan string, 1)
 	auth := make(chan struct{}, 10)
+	monitor := &Monitor{}
 	go func() {
-		done <- Run(ctx, c, func(format string, args ...any) {
+		done <- RunObserved(ctx, c, func(format string, args ...any) {
 			line := fmt.Sprintf(format, args...)
 			if strings.HasPrefix(line, "SOCKS5 ready on ") {
 				ready <- strings.Fields(line)[3]
@@ -78,7 +79,7 @@ func TestSOCKSListenerSurvivesRealServerRestart(t *testing.T) {
 			if strings.HasPrefix(line, "Hy2 authenticated") {
 				auth <- struct{}{}
 			}
-		})
+		}, monitor)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -86,6 +87,9 @@ func TestSOCKSListenerSurvivesRealServerRestart(t *testing.T) {
 		case e := <-done:
 			if !errors.Is(e, context.Canceled) {
 				t.Errorf("shutdown: %v", e)
+			}
+			if s := monitor.Snapshot(); s.Phase != "stopped" || s.Hy2.Connected {
+				t.Errorf("stale status after shutdown: %+v", s)
 			}
 		case <-time.After(5 * time.Second):
 			t.Error("engine shutdown stuck")
@@ -134,6 +138,10 @@ func TestSOCKSListenerSurvivesRealServerRestart(t *testing.T) {
 		}
 	}
 	check()
+	first := monitor.Snapshot()
+	if first.Phase != "online" || first.Device != address || first.Wire.UpBytes == 0 || first.Wire.DownBytes == 0 {
+		t.Fatalf("missing live telemetry: %+v", first)
+	}
 	s.Stop()
 	// Restart on the same port. The old QUIC connection is unknown to the new
 	// server; the client must detect loss and authenticate a fresh connection.
@@ -144,6 +152,10 @@ func TestSOCKSListenerSurvivesRealServerRestart(t *testing.T) {
 		t.Fatal("no automatic reconnect")
 	}
 	check()
+	last := monitor.Snapshot()
+	if last.Hy2.Reconnects == 0 || last.Wire.UpBytes <= first.Wire.UpBytes || last.Wire.DownBytes <= first.Wire.DownBytes {
+		t.Fatalf("telemetry reset across reconnect: before=%+v after=%+v", first, last)
+	}
 }
 
 func TestAuthenticationFailuresStopWithoutListener(t *testing.T) {

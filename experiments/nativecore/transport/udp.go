@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -15,7 +16,20 @@ type Conn struct {
 	// Do not expose UDP fast paths that would bypass peer filtering.
 	socket *net.UDPConn
 	peer   netip.AddrPort
+	meter  *Meter
 }
+
+// Traffic counts accepted Hy2 datagrams, including protocol overhead. TURN's
+// outer SRTP/relay framing and direct routing-policy traffic are not included.
+type Traffic struct{ UpBytes, DownBytes, UpPackets, DownPackets uint64 }
+type Meter struct{ up, down, upPackets, downPackets atomic.Uint64 }
+
+func (m *Meter) Snapshot() Traffic {
+	return Traffic{m.up.Load(), m.down.Load(), m.upPackets.Load(), m.downPackets.Load()}
+}
+
+// SetMeter must be called before the connection is handed to Hy2.
+func (c *Conn) SetMeter(m *Meter) { c.meter = m }
 
 // Open requires an IP literal. Pipe mode is loopback-only, since breach-client's
 // UDP input has no authentication of its own. Hy2 is unmodified in BOTH modes:
@@ -64,6 +78,10 @@ func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if n != len(wire) {
 		return 0, io.ErrShortWrite
 	}
+	if c.meter != nil {
+		c.meter.up.Add(uint64(n))
+		c.meter.upPackets.Add(1)
+	}
 	return len(p), nil
 }
 
@@ -74,6 +92,10 @@ func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 			return 0, nil, err
 		}
 		if from == c.peer {
+			if c.meter != nil {
+				c.meter.down.Add(uint64(n))
+				c.meter.downPackets.Add(1)
+			}
 			return n, net.UDPAddrFromAddrPort(from), nil
 		}
 	}

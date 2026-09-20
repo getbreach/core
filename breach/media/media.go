@@ -6,6 +6,7 @@
 package media
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -58,6 +59,7 @@ type Session struct {
 	out, in *srtp.Context
 
 	mu     sync.Mutex
+	inMu   sync.Mutex
 	ssrc   uint32
 	seq    uint16
 	ts     uint32
@@ -69,6 +71,17 @@ type Session struct {
 // competing for inbound datagrams (conn.Close must free, not kill, the channel).
 func Client(conn net.Conn) (*Session, error) {
 	dc, err := dtls.Client(conn, dtlscfg.Client())
+	if err != nil {
+		return nil, fmt.Errorf("dtls client: %w", err)
+	}
+	s, err := newSession(dc, true)
+	dc.Close()
+	return s, err
+}
+
+// ClientContext bounds a new stream handshake without affecting other streams.
+func ClientContext(ctx context.Context, conn net.Conn) (*Session, error) {
+	dc, err := dtls.ClientWithContext(ctx, conn, dtlscfg.Client())
 	if err != nil {
 		return nil, fmt.Errorf("dtls client: %w", err)
 	}
@@ -134,9 +147,8 @@ func newSession(dc *dtls.Conn, isClient bool) (*Session, error) {
 // SetMaxPadding overrides the upper bound on the random RTP padding Protect adds
 // to each packet; 0 disables padding entirely. Padding is self-describing on the
 // wire (RFC 3550 §5.1) and stripped by the receiver's rtp.Unmarshal, so the two
-// ends need not agree on this value — each shapes only its own outbound. Call it
-// before the session starts sending; it is not safe to change concurrently with
-// Protect.
+// ends need not agree on this value — each shapes only its own outbound.
+// It may be changed concurrently with Protect.
 func (s *Session) SetMaxPadding(max byte) {
 	s.mu.Lock()
 	s.padMax = max
@@ -156,6 +168,9 @@ func (s *Session) SetMaxPadding(max byte) {
 // this is a send-only change that needs no coordination with the far end.
 func (s *Session) Protect(pt byte, payload []byte) ([]byte, error) {
 	s.mu.Lock()
+	// Sequence allocation and SRTP rollover/cipher state are one operation.
+	// Uplink data and keepalives may share this session concurrently.
+	defer s.mu.Unlock()
 	pkt := &rtp.Packet{
 		Header:  rtp.Header{Version: 2, PayloadType: pt, SequenceNumber: s.seq, Timestamp: s.ts, SSRC: s.ssrc},
 		Payload: payload,
@@ -179,8 +194,6 @@ func (s *Session) Protect(pt byte, payload []byte) ([]byte, error) {
 			}
 		}
 	}
-	s.mu.Unlock()
-
 	raw, err := pkt.Marshal()
 	if err != nil {
 		return nil, err
@@ -190,6 +203,8 @@ func (s *Session) Protect(pt byte, payload []byte) ([]byte, error) {
 
 // Unprotect decrypts an SRTP packet and returns its payload type and payload.
 func (s *Session) Unprotect(wire []byte) (pt byte, payload []byte, err error) {
+	s.inMu.Lock()
+	defer s.inMu.Unlock()
 	dec, err := s.in.DecryptRTP(nil, wire, nil)
 	if err != nil {
 		return 0, nil, err
