@@ -45,14 +45,33 @@ func LoadCachedCreds(dir, token string) []*Creds {
 
 // SaveCachedCreds persists an account's minted credentials for reuse on the next
 // connect. Stored in the app's private dir; the filename is a hash of the token.
-func SaveCachedCreds(dir, token string, list []*Creds) {
-	if dir == "" || token == "" || len(list) == 0 {
-		return
+func SaveCachedCreds(dir, token string, list []*Creds) error {
+	if dir == "" || token == "" {
+		return nil
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
+		return err
 	}
-	if data, err := json.Marshal(list); err == nil {
-		_ = os.WriteFile(credCacheFile(dir, token), data, 0o600)
+	data, err := json.Marshal(list)
+	if err != nil {
+		return err
 	}
+	// A private temporary file avoids exposing credentials and leaves the old
+	// cache intact if writing fails or the process exits before replacement.
+	f, err := os.CreateTemp(dir, ".creds-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), credCacheFile(dir, token))
 }

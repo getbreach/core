@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"runtime"
 
 	"breach-nativecore/hy2"
@@ -64,7 +65,38 @@ func Load(path, defaultMode string) (Config, error) {
 	if err = d.Decode(new(any)); err != io.EOF {
 		return c, errors.New("config must contain exactly one JSON object")
 	}
+	if c.Mode == "turn" {
+		if err = c.resolveCredCache(path); err != nil {
+			return c, err
+		}
+	}
 	return c, c.Validate()
+}
+
+// Config-adjacent storage stays stable across working directories and sudo.
+// This only resolves paths: `check` must not create any cache files.
+func (c *Config) resolveCredCache(configPath string) error {
+	var v map[string]json.RawMessage
+	if err := json.Unmarshal(c.Turn, &v); err != nil || v == nil {
+		return errors.New("turn must contain a MAX/WB transport configuration")
+	}
+	var dir string
+	if raw, ok := v["credCacheDir"]; ok && json.Unmarshal(raw, &dir) != nil {
+		return errors.New("turn.credCacheDir must be a string")
+	}
+	if dir == "" {
+		dir = filepath.Join(".breach-cache", "turn")
+	}
+	if !filepath.IsAbs(dir) {
+		var err error
+		dir, err = filepath.Abs(filepath.Join(filepath.Dir(configPath), dir))
+		if err != nil {
+			return err
+		}
+	}
+	v["credCacheDir"], _ = json.Marshal(dir)
+	c.Turn, _ = json.Marshal(v)
+	return nil
 }
 
 func (c Config) Validate() error {

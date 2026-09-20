@@ -87,28 +87,51 @@ func (t *Tunnel) PoolLimits() string {
 // Accessed only under buildMu. Keep unused credentials in memory so lowering
 // mints and raising them again doesn't create another call while they are valid.
 func (c *core) cachedCreds(dir, key string) []*maxproto.Creds {
+	// Load disk once per account. Memory is authoritative afterwards, including
+	// an empty list after rejecting spent credentials; don't resurrect those.
+	list, loaded := c.credentialGroups[key]
+	if !loaded {
+		list = maxproto.LoadCachedCreds(dir, key)
+	}
 	var valid []*maxproto.Creds
-	for _, cr := range c.credentialGroups[key] {
+	for _, cr := range list {
 		if cr != nil && time.Until(cr.ExpiresAt) >= 30*time.Minute {
 			valid = append(valid, cr)
 		}
 	}
-	if len(valid) > 0 {
-		return valid
-	}
-	return maxproto.LoadCachedCreds(dir, key)
-}
-func (c *core) rememberCreds(dir, key string, usable, cached []*maxproto.Creds) {
 	if c.credentialGroups == nil {
 		c.credentialGroups = make(map[string][]*maxproto.Creds)
 	}
-	saved := append([]*maxproto.Creds(nil), usable...)
-	if len(cached) > c.nMints {
-		saved = append(saved, cached[c.nMints:]...)
+	c.credentialGroups[key] = valid
+	return valid
+}
+func (c *core) rememberCreds(dir, key string, cached []*maxproto.Creds) {
+	if c.credentialGroups == nil {
+		c.credentialGroups = make(map[string][]*maxproto.Creds)
+	}
+	var saved []*maxproto.Creds
+	for _, cr := range cached {
+		if cr != nil && time.Until(cr.ExpiresAt) >= 30*time.Minute {
+			saved = append(saved, cr)
+		}
 	}
 	c.credentialGroups[key] = saved
-	maxproto.SaveCachedCreds(dir, key, saved)
+	if err := maxproto.SaveCachedCreds(dir, key, saved); err != nil {
+		c.log("credential cache write failed: %v", err)
+	}
 }
+
+// Keep the builder's indexes stable even if an earlier mint failed. Persist
+// each success before opening allocations, which can block or be cancelled.
+func (c *core) cacheCredential(dir, key string, cached []*maxproto.Creds, index int, cr *maxproto.Creds) []*maxproto.Creds {
+	for len(cached) <= index {
+		cached = append(cached, nil)
+	}
+	cached[index] = cr
+	c.rememberCreds(dir, key, cached)
+	return cached
+}
+
 func streamOpen(s *stream) bool {
 	select {
 	case <-s.done:

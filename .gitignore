@@ -4,6 +4,9 @@ config.json
 /breach/config.native.json
 /breach/config.macos.json
 /breach/native-macos-fakeip.jsonl
+.breach-cache/
+creds_*.json
+.creds-*
 
 # build artifacts
 /maxmint/maxmint

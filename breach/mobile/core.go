@@ -488,7 +488,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 				default:
 				}
 				var creds *maxproto.Creds
-				fromCache := m < len(cached)
+				fromCache := m < len(cached) && cached[m] != nil
 				if fromCache {
 					creds = cached[m]
 				} else {
@@ -500,6 +500,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 						continue
 					}
 					creds = nc
+					cached = c.cacheCredential(c.credCacheDir, key, cached, m, creds)
 				}
 				result := openCred(creds)
 				src := "cache"
@@ -513,12 +514,16 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					c.log("wb minter%d cred%d: cached cred quota exhausted, re-minting...", mi, m)
 					if nc, err := mtr.Mint(""); err == nil {
 						creds = nc
+						cached = c.cacheCredential(c.credCacheDir, key, cached, m, creds)
 						result = openCred(creds)
 						c.log("wb minter%d cred%d (remint): %d/%d allocations up", mi, m, result.opened, c.nStreams)
 					} else {
 						c.log("wb minter%d cred%d: re-mint FAILED: %v", mi, m, err)
 						c.setErr("wb re-mint failed: %v", err)
 					}
+				}
+				if result.quota >= c.nStreams && result.opened == 0 {
+					cached = c.cacheCredential(c.credCacheDir, key, cached, m, nil)
 				}
 				if result.quota < c.nStreams || result.opened > 0 {
 					usable = append(usable, creds)
@@ -527,7 +532,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					}
 				}
 			}
-			c.rememberCreds(c.credCacheDir, key, usable, cached)
+			c.rememberCreds(c.credCacheDir, key, cached)
 			allCreds = append(allCreds, usable...)
 		}
 	} else {
@@ -559,7 +564,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 				default:
 				}
 				var creds *maxproto.Creds
-				fromCache := m < len(cached)
+				fromCache := m < len(cached) && cached[m] != nil
 				if fromCache {
 					creds = cached[m]
 				} else {
@@ -571,6 +576,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 						break
 					}
 					creds = nc
+					cached = c.cacheCredential(c.cfg.CredCacheDir, acfg.Token, cached, m, creds)
 					if c.cfg.ReuseGroupCall {
 						reuseLink = nc.JoinLink
 					}
@@ -587,6 +593,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					c.log("acct%d cred%d: cached cred quota exhausted, re-minting (new conference)...", ai, m)
 					if nc, err := maxproto.MintFrom(acfg, ""); err == nil {
 						creds = nc
+						cached = c.cacheCredential(c.cfg.CredCacheDir, acfg.Token, cached, m, creds)
 						if c.cfg.ReuseGroupCall {
 							reuseLink = nc.JoinLink
 						}
@@ -597,6 +604,9 @@ func (c *core) buildPool(freshMint bool) time.Time {
 						c.setErr("re-mint acct%d failed: %v", ai, err)
 					}
 				}
+				if result.quota >= c.nStreams && result.opened == 0 {
+					cached = c.cacheCredential(c.cfg.CredCacheDir, acfg.Token, cached, m, nil)
+				}
 				if result.quota < c.nStreams || result.opened > 0 {
 					usable = append(usable, creds)
 					if earliest.IsZero() || creds.ExpiresAt.Before(earliest) {
@@ -604,7 +614,7 @@ func (c *core) buildPool(freshMint bool) time.Time {
 					}
 				}
 			}
-			c.rememberCreds(c.cfg.CredCacheDir, acfg.Token, usable, cached)
+			c.rememberCreds(c.cfg.CredCacheDir, acfg.Token, cached)
 			allCreds = append(allCreds, usable...)
 		}
 	}
@@ -728,9 +738,9 @@ func (c *core) replenishLoop() {
 			result := c.replenish()
 			progress = result.opened > 0
 			if result.opened == 0 && result.quota > 0 {
-				c.log("TURN quota exhausted -> rebuilding with fresh credentials")
+				c.log("TURN quota exhausted -> checking cached credentials and replacing spent ones")
 				before := c.p.length()
-				c.buildPool(true)
+				c.buildPool(false)
 				progress = c.p.length() > before
 			}
 		}
